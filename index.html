@@ -4,15 +4,25 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#0f6b4f">
+  <meta name="description" content="Control del almacén de bebidas: llegadas, ventas, cobros, camión y ganancias.">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Almacén">
   <title>Mi Almacén</title>
   <link rel="manifest" href="manifest.webmanifest">
   <link rel="icon" href="icono.svg" type="image/svg+xml">
-  <link rel="apple-touch-icon" href="icono.svg">
+  <link rel="icon" href="iconos/icono-192.png" type="image/png" sizes="192x192">
+  <link rel="apple-touch-icon" href="iconos/apple-touch-icon.png">
+  <link rel="preload" href="fuentes/nunito.woff2" as="font" type="font/woff2" crossorigin>
   <link rel="stylesheet" href="css/estilos.css">
 </head>
 <body>
-  <main id="app"><p class="cargando">Cargando…</p></main>
+  <div id="estado" hidden></div>
+  <main id="app"><div class="cargando" aria-label="Cargando"><div class="bloque alto"></div><div class="bloque"></div><div class="bloque"></div></div></main>
   <div id="aviso" role="status" aria-live="polite"></div>
+  <script src="js/vendor/supabase.js"></script>
   <script type="module" src="js/app.js"></script>
+  <script>
+    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js');
+  </script>
 </body>
 </html>

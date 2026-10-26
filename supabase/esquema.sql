@@ -61,6 +61,7 @@ create table lotes (
 create table viajes (
   id                  bigint generated always as identity primary key,
   owner               uuid not null default auth.uid(),
+  ref                 uuid not null unique default gen_random_uuid(),  -- código creado en el aparato
   salida              timestamptz not null default now(),
   regreso             timestamptz,
   efectivo_esperado   numeric(12,2),
@@ -139,6 +140,15 @@ create table gastos (
   nota       text
 );
 
+-- Cambios ya aplicados (para no repetir lo que se subió sin internet)
+create table operaciones (
+  op_id      uuid primary key,
+  owner      uuid not null default auth.uid(),
+  tipo       text not null,
+  resultado  jsonb,
+  creado     timestamptz not null default now()
+);
+
 create index on lotes (producto_id);
 create index on venta_items (lote_id);
 create index on venta_items (venta_id);
@@ -154,7 +164,7 @@ do $$
 declare t text;
 begin
   foreach t in array array['productos','clientes','precios_cliente','lotes','viajes','viaje_carga',
-                           'ventas','venta_items','pagos','bajas','gastos'] loop
+                           'ventas','venta_items','pagos','bajas','gastos','operaciones'] loop
     execute format('alter table %I enable row level security', t);
     execute format('create policy solo_dueno on %I for all to authenticated
                     using (owner = auth.uid()) with check (owner = auth.uid())', t);
@@ -216,8 +226,7 @@ group by c.id;
 -- ---------- Funciones ----------
 
 -- Registra una venta y descuenta del lote que vence primero.
--- p = {cliente_id, tipo, fecha_compromiso, viaje_id, pagado, nota,
---      items: [{producto_id, cantidad, precio}]}
+-- p = {cliente_id, tipo, fecha, fecha_compromiso, viaje_id, pagado, nota, items: [{producto_id, cantidad, precio}]}
 create or replace function registrar_venta(p jsonb) returns bigint
 language plpgsql as $$
 declare
@@ -226,6 +235,7 @@ declare
   v_cli    bigint  := nullif(p->>'cliente_id', '')::bigint;
   v_viaje  bigint  := nullif(p->>'viaje_id', '')::bigint;
   v_pagado numeric := coalesce(nullif(p->>'pagado', '')::numeric, 0);
+  v_fecha  timestamptz := coalesce(nullif(p->>'fecha', '')::timestamptz, now());
   v_total  numeric;
   it       jsonb;
   l        record;
@@ -241,8 +251,8 @@ begin
     raise exception 'La venta no tiene productos';
   end if;
 
-  insert into ventas (cliente_id, tipo, fecha_compromiso, entregado, viaje_id, nota)
-  values (v_cli, v_tipo, nullif(p->>'fecha_compromiso', '')::date, v_tipo <> 'pedido', v_viaje, p->>'nota')
+  insert into ventas (fecha, cliente_id, tipo, fecha_compromiso, entregado, viaje_id, nota)
+  values (v_fecha, v_cli, v_tipo, nullif(p->>'fecha_compromiso', '')::date, v_tipo <> 'pedido', v_viaje, p->>'nota')
   returning id into v_id;
 
   for it in select * from jsonb_array_elements(p->'items') loop
@@ -278,16 +288,16 @@ begin
   if v_tipo = 'contado' then v_pagado := v_total; end if;
   if v_tipo = 'regalo'  then v_pagado := 0;       end if;
   if v_pagado > 0 then
-    insert into pagos (cliente_id, venta_id, viaje_id, monto)
-    values (v_cli, v_id, v_viaje, least(v_pagado, v_total));
+    insert into pagos (fecha, cliente_id, venta_id, viaje_id, monto)
+    values (v_fecha, v_cli, v_id, v_viaje, least(v_pagado, v_total));
   end if;
 
   return v_id;
 end $$;
 
--- Da de baja mercadería (pinchada, vencida…) empezando por el lote que vence primero
 create or replace function registrar_baja(p_producto bigint, p_cantidad numeric, p_motivo text,
-                                          p_viaje bigint default null, p_nota text default null)
+                                          p_viaje bigint default null, p_nota text default null,
+                                          p_fecha timestamptz default now())
 returns void
 language plpgsql as $$
 declare
@@ -300,8 +310,8 @@ begin
            order by vencimiento asc nulls last, fecha, id loop
     exit when falta <= 0;
     tomar := least(falta, l.restante);
-    insert into bajas (producto_id, lote_id, cantidad, costo, motivo, viaje_id, nota)
-    values (p_producto, l.id, tomar, l.costo_real, p_motivo, p_viaje, p_nota);
+    insert into bajas (fecha, producto_id, lote_id, cantidad, costo, motivo, viaje_id, nota)
+    values (p_fecha, p_producto, l.id, tomar, l.costo_real, p_motivo, p_viaje, p_nota);
     falta := falta - tomar;
   end loop;
 
@@ -310,9 +320,8 @@ begin
   end if;
 end $$;
 
--- Cierra el viaje del camión: guarda lo devuelto, marca faltantes como pinchados y cuadra la plata.
--- p_devueltos = [{producto_id, devuelto}]
-create or replace function cerrar_viaje(p_viaje bigint, p_devueltos jsonb, p_efectivo numeric, p_marcar boolean)
+create or replace function cerrar_viaje(p_viaje bigint, p_devueltos jsonb, p_efectivo numeric, p_marcar boolean,
+                                        p_fecha timestamptz default now())
 returns void
 language plpgsql as $$
 declare
@@ -336,13 +345,122 @@ begin
 
     faltante := c.cargado - vendido - dev;
     if p_marcar and faltante > 0 then
-      perform registrar_baja(c.producto_id, faltante, 'pinchada', p_viaje, 'Faltante al regresar el camión');
+      perform registrar_baja(c.producto_id, faltante, 'pinchada', p_viaje, 'Faltante al regresar el camión', p_fecha);
     end if;
   end loop;
 
   select coalesce(sum(monto), 0) into esperado from pagos where viaje_id = p_viaje;
 
   update viajes
-  set regreso = now(), efectivo_esperado = esperado, efectivo_entregado = p_efectivo
+  set regreso = p_fecha, efectivo_esperado = esperado, efectivo_entregado = p_efectivo
   where id = p_viaje;
+end $$;
+
+-- Busca el cliente por nombre (sin importar mayúsculas) o lo crea
+create or replace function cliente_por_nombre(p_nombre text) returns bigint
+language plpgsql as $$
+declare v_id bigint;
+begin
+  if coalesce(trim(p_nombre), '') = '' then return null; end if;
+  select id into v_id from clientes where lower(trim(nombre)) = lower(trim(p_nombre)) order by id limit 1;
+  if v_id is null then
+    insert into clientes (nombre) values (trim(p_nombre)) returning id into v_id;
+  end if;
+  return v_id;
+end $$;
+
+-- Una llegada con varios productos. Crea los productos que no existan.
+-- p = {fecha, proveedor, lineas: [{producto_id?, nombre, marca, presentacion, sabor, unidad, precio,
+--                                  cant_pagada, cant_regalo, costo_unit, flete, vencimiento}]}
+create or replace function registrar_llegada(p jsonb) returns jsonb
+language plpgsql as $$
+declare
+  l       jsonb;
+  v_prod  bigint;
+  v_lote  bigint;
+  v_lotes jsonb := '[]';
+  v_precio numeric;
+begin
+  for l in select * from jsonb_array_elements(p->'lineas') loop
+    v_prod   := nullif(l->>'producto_id', '')::bigint;
+    v_precio := coalesce(nullif(l->>'precio', '')::numeric, 0);
+    if v_prod is null then
+      select id into v_prod from productos
+      where lower(coalesce(marca, nombre)) = lower(l->>'marca')
+        and lower(coalesce(presentacion, '')) = lower(coalesce(l->>'presentacion', ''))
+        and lower(coalesce(sabor, '')) = lower(coalesce(l->>'sabor', ''))
+      order by id limit 1;
+    end if;
+    if v_prod is null then
+      insert into productos (nombre, marca, presentacion, sabor, unidad, precio_general)
+      values (l->>'nombre', l->>'marca', nullif(l->>'presentacion', ''), nullif(l->>'sabor', ''),
+              coalesce(nullif(l->>'unidad', ''), 'paq'), v_precio)
+      returning id into v_prod;
+    elsif v_precio > 0 then
+      update productos set precio_general = v_precio where id = v_prod and precio_general = 0;
+    end if;
+
+    insert into lotes (producto_id, fecha, proveedor, cant_pagada, cant_regalo, costo_unit, flete, vencimiento)
+    values (v_prod, coalesce(nullif(p->>'dia', '')::date, current_date), nullif(p->>'proveedor', ''),
+            (l->>'cant_pagada')::numeric, coalesce(nullif(l->>'cant_regalo', '')::numeric, 0),
+            (l->>'costo_unit')::numeric, coalesce(nullif(l->>'flete', '')::numeric, 0),
+            nullif(l->>'vencimiento', '')::date)
+    returning id into v_lote;
+    v_lotes := v_lotes || to_jsonb(v_lote);
+  end loop;
+  return jsonb_build_object('lotes', v_lotes);
+end $$;
+
+-- Punto único para subir cambios (con o sin internet). Si op_id ya se aplicó, no hace nada.
+create or replace function aplicar_operacion(p_op uuid, p_tipo text, p jsonb) returns jsonb
+language plpgsql as $$
+declare
+  r        jsonb;
+  v_fecha  timestamptz := coalesce(nullif(p->>'fecha', '')::timestamptz, now());
+  v_viaje  bigint;
+begin
+  select resultado into r from operaciones where op_id = p_op;
+  if found then return coalesce(r, '{}'::jsonb) || '{"repetida": true}'::jsonb; end if;
+  r := '{}'::jsonb;
+
+  if nullif(p->>'viaje_ref', '') is not null then
+    select id into v_viaje from viajes where ref = (p->>'viaje_ref')::uuid;
+  end if;
+
+  case p_tipo
+    when 'venta' then
+      r := jsonb_build_object('venta_id', registrar_venta(p || jsonb_build_object(
+             'cliente_id', cliente_por_nombre(p->>'cliente_nombre'), 'viaje_id', v_viaje, 'fecha', v_fecha)));
+    when 'llegada' then
+      r := registrar_llegada(p);
+    when 'pago' then
+      insert into pagos (fecha, cliente_id, viaje_id, monto)
+      values (v_fecha, (p->>'cliente_id')::bigint, v_viaje, (p->>'monto')::numeric);
+    when 'entregar' then
+      if coalesce(nullif(p->>'cobrar', '')::numeric, 0) > 0 then
+        insert into pagos (fecha, cliente_id, venta_id, monto)
+        values (v_fecha, (p->>'cliente_id')::bigint, (p->>'venta_id')::bigint, (p->>'cobrar')::numeric);
+      end if;
+      update ventas set entregado = true where id = (p->>'venta_id')::bigint;
+    when 'gasto' then
+      insert into gastos (fecha, categoria, monto, nota)
+      values (coalesce(nullif(p->>'dia', '')::date, v_fecha::date), p->>'categoria', (p->>'monto')::numeric, nullif(p->>'nota', ''));
+    when 'baja' then
+      perform registrar_baja((p->>'producto_id')::bigint, (p->>'cantidad')::numeric, p->>'motivo', null, nullif(p->>'nota', ''), v_fecha);
+    when 'salida' then
+      insert into viajes (ref, salida) values ((p->>'viaje_ref')::uuid, v_fecha) returning id into v_viaje;
+      insert into viaje_carga (viaje_id, producto_id, cargado)
+      select v_viaje, (x->>'producto_id')::bigint, (x->>'cantidad')::numeric
+      from jsonb_array_elements(p->'carga') x;
+    when 'regreso' then
+      if v_viaje is null then raise exception 'No se encontró el viaje del camión'; end if;
+      perform cerrar_viaje(v_viaje, p->'devueltos', (p->>'efectivo')::numeric, (p->>'marcar')::boolean, v_fecha);
+    when 'cancelar_salida' then
+      delete from viajes where id = v_viaje;
+    else
+      raise exception 'Operación desconocida: %', p_tipo;
+  end case;
+
+  insert into operaciones (op_id, tipo, resultado) values (p_op, p_tipo, r);
+  return r;
 end $$;

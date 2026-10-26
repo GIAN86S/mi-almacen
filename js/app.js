@@ -1,8 +1,10 @@
-import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/+esm';
 import { SUPABASE_URL, SUPABASE_ANON_KEY } from './config.js';
 import { icono } from './iconos.js';
 import { opcionesCatalogo, nombreProducto, clave } from './catalogo.js';
+import { iniciarCola, leerCola, operar, sincronizar, descartar, reintentar } from './cola.js';
 
+// supabase-js va dentro de la app (js/vendor) para que cargue sin internet
+const { createClient } = window.supabase;
 const app = document.getElementById('app');
 const configurado = SUPABASE_URL.startsWith('https://') && !SUPABASE_ANON_KEY.startsWith('PEGA');
 const sb = configurado ? createClient(SUPABASE_URL, SUPABASE_ANON_KEY) : null;
@@ -75,11 +77,35 @@ async function todas(armar) {
 const leer = (k, defecto) => { try { return localStorage.getItem(k) ?? defecto; } catch { return defecto; } };
 const guardar = (k, valor) => { try { localStorage.setItem(k, valor); } catch { /* sin almacenamiento */ } };
 
+// Cada pantalla toma el color de su sección (ver [data-seccion] en estilos.css)
 function pantalla(ico, titulo, html, volver = '#inicio') {
+  app.dataset.seccion = ico;
   app.innerHTML = `
     ${volver ? `<a class="volver" href="${volver}">${icono('volver')} Volver</a>` : ''}
-    <h1>${ico ? icono(ico) : ''}${titulo}</h1>
+    <h1>${ico ? `<span class="burbuja">${icono(ico)}</span>` : ''}${titulo}</h1>
     ${html}`;
+}
+
+const CARGANDO = '<div class="cargando" aria-label="Cargando"><div class="bloque bajo"></div><div class="bloque alto"></div><div class="bloque"></div><div class="bloque"></div></div>';
+
+// Los montos del panel suben contando hasta su valor
+function animarNumeros() {
+  if (matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+  for (const el of $$('[data-monto]')) {
+    const final = n(el.dataset.monto);
+    const inicioT = performance.now();
+    const paso = t => {
+      const p = Math.min(1, (t - inicioT) / 700);
+      el.textContent = bs(final * (1 - Math.pow(1 - p, 3)));
+      if (p < 1 && el.isConnected) requestAnimationFrame(paso);
+    };
+    requestAnimationFrame(paso);
+  }
+}
+
+function saludo() {
+  const h = new Date().getHours();
+  return h < 12 ? 'Buenos días' : h < 19 ? 'Buenas tardes' : 'Buenas noches';
 }
 
 const $ = sel => app.querySelector(sel);
@@ -95,9 +121,59 @@ async function conEspera(boton, accion) {
   finally { boton.disabled = false; }
 }
 
+// =====================================================================
+// Sin internet: cola de cambios, aviso de estado y datos locales
+// =====================================================================
+
+const sinInternet = () => !navigator.onLine;
+
+// Lo que se guardó: avisa si quedó en el aparato
+const avisoGuardado = (r, texto) =>
+  aviso(r.subido ? texto : `${texto}. Sin internet: queda guardado y se sube solo.`);
+
+function necesitaInternet() {
+  if (sinInternet()) throw new Error('Para esto necesitas internet. Inténtalo cuando vuelva la señal.');
+}
+
+function dibujarEstado(cola = leerCola()) {
+  const el = document.getElementById('estado');
+  const conError = cola.filter(o => o.error).length;
+  const esperando = cola.length - conError;
+  let texto = '';
+  if (conError) texto = `${icono('alerta')} ${conError} cambio(s) no se pudieron subir · <a href="#pendientes">Ver</a>`;
+  else if (sinInternet()) texto = `Sin internet${esperando ? ` · ${esperando} cambio(s) guardados en el aparato` : ' · puedes seguir trabajando'}`;
+  else if (esperando) texto = `Subiendo ${esperando} cambio(s)…`;
+  el.innerHTML = texto;
+  el.hidden = !texto;
+  el.className = conError ? 'error' : sinInternet() ? 'offline' : 'subiendo';
+}
+window.addEventListener('online', () => dibujarEstado());
+window.addEventListener('offline', () => dibujarEstado());
+
+// Cambios de la cola que todavía no llegaron a Supabase (para no mostrar datos atrasados)
+const enCola = tipo => leerCola().filter(o => o.tipo === tipo);
+
+// Deuda de un cliente: lo que dice Supabase + fiados, pedidos y cobros que siguen en la cola
+function saldoCliente(c, saldoServidor = 0) {
+  let saldo = n(saldoServidor);
+  const nombre = c.nombre.trim().toLowerCase();
+  for (const { tipo, datos: d } of leerCola()) {
+    if (tipo === 'venta' && (d.tipo === 'fiado' || d.tipo === 'pedido') && (d.cliente_nombre || '').trim().toLowerCase() === nombre) {
+      const total = d.items.reduce((t, i) => t + n(i.cantidad) * n(i.precio), 0);
+      saldo += total - Math.min(n(d.pagado), total);
+    }
+    if (tipo === 'pago' && c.id && d.cliente_id === c.id) saldo -= n(d.monto);
+    if (tipo === 'entregar' && c.id && d.cliente_id === c.id) saldo -= n(d.cobrar);
+  }
+  return saldo;
+}
+
 async function viajeAbierto() {
-  const filas = await q(sb.from('viajes').select('id, salida').is('regreso', null).limit(1));
-  return filas[0] || null;
+  const cerrado = ref => leerCola().some(o => (o.tipo === 'regreso' || o.tipo === 'cancelar_salida') && o.datos.viaje_ref === ref);
+  const filas = await q(sb.from('viajes').select('id, ref, salida').is('regreso', null).limit(1)).catch(() => []);
+  if (filas[0] && !cerrado(filas[0].ref)) return filas[0];
+  const salida = enCola('salida').filter(o => !cerrado(o.datos.viaje_ref)).at(-1);
+  return salida ? { ref: salida.datos.viaje_ref, salida: salida.datos.fecha, local: true, carga: salida.datos.carga } : null;
 }
 
 async function stockDisponible() {
@@ -115,6 +191,26 @@ async function stockDisponible() {
     p.restante += n(l.restante);
     p.valor += n(l.restante) * n(l.costo_real);
     p.lotes.push(l);
+  }
+
+  // Descontar/sumar lo que está en la cola y todavía no se subió
+  const cambio = {};
+  const mover = (id, c) => { if (id) cambio[id] = (cambio[id] || 0) + n(c); };
+  for (const op of leerCola()) {
+    if (op.tipo === 'venta') op.datos.items.forEach(i => mover(i.producto_id, -i.cantidad));
+    if (op.tipo === 'baja') mover(op.datos.producto_id, -op.datos.cantidad);
+    if (op.tipo === 'llegada') op.datos.lineas.forEach(l => mover(l.producto_id, n(l.cant_pagada) + n(l.cant_regalo)));
+  }
+  for (const [id, c] of Object.entries(cambio)) {
+    const p = porProducto[id];
+    if (p) {
+      p.restante += c;
+      p.valor += c * p.costoPrimero;
+      if (p.restante <= 1e-9) delete porProducto[id];
+    } else if (c > 0) {
+      const l = enCola('llegada').flatMap(o => o.datos.lineas).find(x => x.producto_id == id);
+      porProducto[id] = { id: +id, nombre: l.nombre, unidad: l.unidad, restante: c, valor: c * n(l.costo_unit), costoPrimero: n(l.costo_unit), lotes: [] };
+    }
   }
   return { lotes, porProducto };
 }
@@ -267,12 +363,10 @@ function inicioPeriodo(periodo) {
   return dia ? { dia, ts: new Date(dia + 'T00:00:00').toISOString() } : null;
 }
 
-async function inicio() {
-  const periodo = leer('periodo', 'mes');
+function inicioDatos(periodo) {
   const desde = inicioPeriodo(periodo);
   const filtrar = (consulta, campo, valor) => (desde ? consulta.gte(campo, valor) : consulta);
-
-  const [items, bajas, gastos, lotes, pagos, stock, saldos, pedidos, viaje] = await Promise.all([
+  return Promise.all([
     todas(() => filtrar(sb.from('venta_items').select('cantidad, precio, costo, ventas!inner(fecha, tipo)'), 'ventas.fecha', desde?.ts)),
     todas(() => filtrar(sb.from('bajas').select('cantidad, costo'), 'fecha', desde?.ts)),
     todas(() => filtrar(sb.from('gastos').select('monto'), 'fecha', desde?.dia)),
@@ -283,6 +377,12 @@ async function inicio() {
     q(sb.from('ventas').select('id').eq('tipo', 'pedido').eq('entregado', false)),
     viajeAbierto(),
   ]);
+}
+
+async function inicio() {
+  const periodo = leer('periodo', 'mes');
+  const [items, bajas, gastos, lotes, pagos, stock, saldos, pedidos, viaje] = await inicioDatos(periodo);
+  const enEspera = leerCola().length;
 
   let vendido = 0, costoVendido = 0, regalos = 0;
   for (const it of items) {
@@ -304,30 +404,39 @@ async function inicio() {
 
   const nombres = { hoy: 'Hoy', semana: '7 días', mes: 'Este mes', todo: 'Todo' };
   const alertas = [
+    enEspera && `<a class="alerta amarilla" href="#pendientes">${icono('alerta')}<span>${enEspera} cambio(s) todavía no se subieron: los números de abajo aún no los incluyen.</span></a>`,
     viaje && `<a class="alerta verde" href="#camion">${icono('camion')}<span>El camión está en ruta desde ${fechaHora(viaje.salida)}. Toca aquí al regresar.</span></a>`,
     porVencer.length && `<a class="alerta roja" href="#stock">${icono('alerta')}<span>${porVencer.length} lote(s) vencen en 30 días o menos (${bs(valorPorVencer)}). ¡Véndelos primero!</span></a>`,
     atrasados && `<a class="alerta roja" href="#cobrar">${icono('cobrar')}<span>${atrasados} cliente(s) pasaron su fecha de pago.</span></a>`,
     pedidos.length && `<a class="alerta amarilla" href="#pedidos">${icono('pedidos')}<span>${pedidos.length} pedido(s) por entregar.</span></a>`,
   ].filter(Boolean).join('');
 
+  const boton = (seccion, ruta, texto) =>
+    `<a href="#${ruta}" data-seccion="${seccion}"><span class="burbuja">${icono(seccion)}</span>${texto}</a>`;
+  const hoyLargo = new Date().toLocaleDateString('es-BO', { weekday: 'long', day: 'numeric', month: 'long' });
+
+  app.dataset.seccion = 'vender';
   app.innerHTML = `
-    <h1>Mi Almacén</h1>
+    <section class="portada">
+      <small>${saludo()} · ${hoyLargo}</small>
+      <h1>Mi Almacén</h1>
+      <a class="vender" href="#vender">${icono('vender')} VENDER</a>
+    </section>
     <div class="menu">
-      <a class="ancho" href="#vender">${icono('vender')} VENDER</a>
-      <a href="#llego">${icono('llego')}Llegó mercadería</a>
-      <a href="#cobrar">${icono('cobrar')}Cobrar</a>
-      <a href="#camion">${icono('camion')}Camión</a>
-      <a href="#gasto">${icono('gasto')}Gasto</a>
+      ${boton('llego', 'llego', 'Llegó mercadería')}
+      ${boton('cobrar', 'cobrar', 'Cobrar')}
+      ${boton('camion', 'camion', 'Camión')}
+      ${boton('gasto', 'gasto', 'Gasto')}
     </div>
     ${alertas}
     <div class="chips">
       ${Object.entries(nombres).map(([k, v]) => `<button class="chip ${k === periodo ? 'activo' : ''}" data-periodo="${k}">${v}</button>`).join('')}
     </div>
     <div class="cifras">
-      <div class="cifra"><small>Vendido</small><b>${bs(vendido)}</b></div>
-      <div class="cifra"><small>Ganancia real</small><b class="${neta >= 0 ? 'positivo' : 'negativo'}">${bs(neta)}</b></div>
-      <div class="cifra"><small>Me deben (hoy)</small><b>${bs(meDeben)}</b></div>
-      <div class="cifra"><small>Mercadería en stock</small><b>${bs(valorStock)}</b></div>
+      <div class="cifra" data-seccion="ventas"><small>Vendido</small><b data-monto="${vendido}">${bs(vendido)}</b></div>
+      <div class="cifra" data-seccion="vender"><small>Ganancia real</small><b data-monto="${neta}" class="${neta >= 0 ? 'positivo' : 'negativo'}">${bs(neta)}</b></div>
+      <div class="cifra" data-seccion="cobrar"><small>Me deben (hoy)</small><b data-monto="${meDeben}">${bs(meDeben)}</b></div>
+      <div class="cifra" data-seccion="stock"><small>Mercadería en stock</small><b data-monto="${valorStock}">${bs(valorStock)}</b></div>
     </div>
     <div class="tarjeta">
       <ul class="lineas">
@@ -346,30 +455,74 @@ async function inicio() {
         <li><span>Plata que entró (cobros)</span><b>${bs(cobrado)}</b></li>
       </ul>
     </div>
+    <h3>Más opciones</h3>
     <div class="menu">
-      <a href="#stock">${icono('stock')}Stock y vencimientos</a>
-      <a href="#historial">${icono('ventas')}Ventas</a>
-      <a href="#pedidos">${icono('pedidos')}Pedidos</a>
-      <a href="#clientes">${icono('clientes')}Clientes</a>
-      <a href="#productos">${icono('productos')}Productos</a>
-      <a href="#baja">${icono('baja')}Pinchadas / bajas</a>
+      ${boton('stock', 'stock', 'Stock y vencimientos')}
+      ${boton('ventas', 'historial', 'Ventas')}
+      ${boton('pedidos', 'pedidos', 'Pedidos')}
+      ${boton('clientes', 'clientes', 'Clientes')}
+      ${boton('productos', 'productos', 'Productos')}
+      ${boton('baja', 'baja', 'Pinchadas / bajas')}
     </div>
+    ${botonInstalar()}
     <button class="btn" id="salir" style="width:100%">${icono('salir')} Cerrar sesión</button>`;
 
+  animarNumeros();
   $$('[data-periodo]').forEach(b => b.onclick = () => { guardar('periodo', b.dataset.periodo); inicio(); });
-  $('#salir').onclick = async () => { await sb.auth.signOut(); login(); };
+  activarInstalar();
+  $('#salir').onclick = async () => {
+    const pendientes = leerCola().length;
+    if (pendientes && !confirm(`Hay ${pendientes} cambio(s) que todavía no se subieron. Si cierras sesión se pierden. ¿Cerrar igual?`)) return;
+    if (!pendientes && !confirm('¿Cerrar sesión? Para volver a entrar necesitarás internet.')) return;
+    leerCola().forEach(o => descartar(o.id));
+    navigator.serviceWorker?.controller?.postMessage('borrar-datos');
+    await sb.auth.signOut();
+    login();
+  };
+}
+
+// ---------- Instalar como app (celular y PC) ----------
+
+let pedidoInstalar = null;
+window.addEventListener('beforeinstallprompt', e => {
+  e.preventDefault();
+  pedidoInstalar = e;
+  if (!location.hash || location.hash === '#inicio') inicio().catch(() => {});
+});
+const instalada = () => matchMedia('(display-mode: standalone)').matches || navigator.standalone;
+const esIphone = () => /iphone|ipad|ipod/i.test(navigator.userAgent);
+
+function botonInstalar() {
+  if (instalada()) return '';
+  if (pedidoInstalar) return `<button class="btn primario" id="instalar" style="width:100%;margin-bottom:10px">${icono('llego')} Instalar en este aparato</button>`;
+  if (esIphone()) return `<p class="tarjeta nota">Para instalarla en el iPhone: toca <b>Compartir</b> y luego <b>"Agregar a inicio"</b>.</p>`;
+  return '';
+}
+
+function activarInstalar() {
+  const b = $('#instalar');
+  if (!b) return;
+  b.onclick = async () => {
+    pedidoInstalar.prompt();
+    const { outcome } = await pedidoInstalar.userChoice;
+    pedidoInstalar = null;
+    if (outcome === 'accepted') aviso('App instalada');
+    b.remove();
+  };
 }
 
 // =====================================================================
 // Llegó mercadería: varios productos en una sola llegada
 // =====================================================================
 
+const cargarLlego = () => Promise.all([
+  q(sb.from('productos').select('*')),
+  q(sb.from('lotes').select('producto_id, costo_unit').order('id', { ascending: false }).limit(500)),
+  q(sb.from('v_stock_lotes').select('*').order('id', { ascending: false }).limit(10)),
+]);
+
 async function llego() {
-  const [productos, ultimosLotes, recientes] = await Promise.all([
-    q(sb.from('productos').select('*')),
-    q(sb.from('lotes').select('producto_id, costo_unit').order('id', { ascending: false }).limit(500)),
-    q(sb.from('v_stock_lotes').select('*').order('id', { ascending: false }).limit(10)),
-  ]);
+  const [productos, ultimosLotes, recientes] = await cargarLlego();
 
   // Último costo pagado por producto
   const ultimoCosto = {};
@@ -519,22 +672,10 @@ async function llego() {
     const flete = n($('#flete').value);
     const valor = lineas.reduce((s, l) => s + l.cant_pagada * l.costo_unit, 0);
     const proveedor = $('#proveedor').value.trim();
-    const fechaLlegada = $('#fecha').value || hoy();
+    const dia = $('#fecha').value || hoy();
 
-    // Crear los productos que todavía no existen
-    for (const l of lineas) {
-      if (l.producto_id) continue;
-      const ya = productos.find(p => clave({ marca: p.marca || p.nombre, presentacion: p.presentacion || '', sabor: p.sabor || '' }) === clave(l));
-      if (ya) { l.producto_id = ya.id; continue; }
-      const nuevo = await q(sb.from('productos').insert({
-        nombre: nombreProducto(l), marca: l.marca, presentacion: l.presentacion || null, sabor: l.sabor || null,
-        unidad: l.unidad, precio_general: n(l.precio),
-      }).select().single());
-      productos.push(nuevo);
-      l.producto_id = nuevo.id;
-    }
-
-    // Repartir el flete según el valor de cada producto (el último se lleva el redondeo)
+    // Repartir el flete según el valor de cada producto (el último se lleva el redondeo).
+    // Los productos nuevos los crea Supabase al subir la llegada.
     let repartido = 0;
     const filas = lineas.map((l, i) => {
       const parte = i === lineas.length - 1
@@ -542,22 +683,15 @@ async function llego() {
         : Math.round(flete * (valor ? (l.cant_pagada * l.costo_unit) / valor : 1 / lineas.length) * 100) / 100;
       repartido += parte;
       return {
-        producto_id: l.producto_id, fecha: fechaLlegada, proveedor: proveedor || null,
+        producto_id: l.producto_id ?? null, nombre: nombreProducto(l), marca: l.marca,
+        presentacion: l.presentacion || '', sabor: l.sabor || '', unidad: l.unidad, precio: n(l.precio),
         cant_pagada: l.cant_pagada, cant_regalo: l.cant_regalo, costo_unit: l.costo_unit,
         flete: parte, vencimiento: l.vencimiento,
       };
     });
-    await q(sb.from('lotes').insert(filas));
-
-    // Si se puso precio a un producto que no tenía, guardarlo
-    for (const l of lineas) {
-      const p = productos.find(x => x.id === l.producto_id);
-      if (p && !n(p.precio_general) && n(l.precio)) {
-        await q(sb.from('productos').update({ precio_general: n(l.precio) }).eq('id', p.id));
-      }
-    }
+    const r = await operar('llegada', { dia, proveedor, lineas: filas }, `Llegada de ${lineas.length} producto(s)`);
     guardar('proveedor', proveedor);
-    aviso(`Llegada guardada: ${lineas.length} producto(s)`);
+    avisoGuardado(r, `Llegada guardada: ${lineas.length} producto(s)`);
     llego();
   }
 
@@ -568,13 +702,22 @@ async function llego() {
 // Vender
 // =====================================================================
 
+const cargarVender = () => Promise.all([
+  opcionesConStock(),
+  q(sb.from('clientes').select('id, nombre').eq('activo', true).order('nombre')),
+  q(sb.from('ventas').select('cliente_id').not('cliente_id', 'is', null).order('id', { ascending: false }).limit(300)),
+  viajeAbierto(),
+  todas(() => sb.from('precios_cliente').select('cliente_id, producto_id, precio')),
+  todas(() => sb.from('v_saldos').select('cliente_id, saldo')),
+]);
+
 async function vender() {
-  const [{ opciones }, clientes, recientes, viaje] = await Promise.all([
-    opcionesConStock(),
-    q(sb.from('clientes').select('id, nombre').eq('activo', true).order('nombre')),
-    q(sb.from('ventas').select('cliente_id').not('cliente_id', 'is', null).order('id', { ascending: false }).limit(300)),
-    viajeAbierto(),
-  ]);
+  const [{ opciones }, clientes, recientes, viaje, todosLosPrecios, saldos] = await cargarVender();
+  // Clientes creados sin internet todavía no están en Supabase: se suman por nombre
+  for (const op of enCola('venta')) {
+    const nombre = op.datos.cliente_nombre;
+    if (nombre && !clientes.some(c => c.nombre.trim().toLowerCase() === nombre.trim().toLowerCase())) clientes.push({ id: null, nombre });
+  }
   const buscarCliente = nombre => clientes.find(c => c.nombre.trim().toLowerCase() === nombre.trim().toLowerCase());
 
   // Clientes que más compran últimamente, para tocarlos sin escribir
@@ -646,10 +789,13 @@ async function vender() {
     const c = buscarCliente($('#cliente').value);
     preciosCliente = {};
     if (c) {
-      const filas = await q(sb.from('precios_cliente').select('producto_id, precio').eq('cliente_id', c.id));
-      for (const f of filas) preciosCliente[f.producto_id] = n(f.precio);
-      const [saldo] = await q(sb.from('v_saldos').select('saldo').eq('cliente_id', c.id));
-      $('#nota-cliente').innerHTML = n(saldo?.saldo) > 0 ? `<span class="negativo">Debe ${bs(saldo.saldo)}</span>` : 'No tiene deudas.';
+      for (const f of todosLosPrecios.filter(f => f.cliente_id === c.id)) preciosCliente[f.producto_id] = n(f.precio);
+      // Precios dados sin internet a este cliente (todavía en la cola)
+      for (const op of enCola('venta').filter(o => (o.datos.cliente_nombre || '').trim().toLowerCase() === c.nombre.trim().toLowerCase())) {
+        if (op.datos.tipo !== 'regalo') op.datos.items.forEach(i => (preciosCliente[i.producto_id] = n(i.precio)));
+      }
+      const debe = saldoCliente(c, saldos.find(s => s.cliente_id === c.id)?.saldo);
+      $('#nota-cliente').innerHTML = debe > 0.009 ? `<span class="negativo">Debe ${bs(debe)}</span>` : 'No tiene deudas.';
     } else {
       $('#nota-cliente').textContent = $('#cliente').value.trim() ? 'Cliente nuevo: se guardará al vender.' : '';
     }
@@ -717,20 +863,18 @@ async function vender() {
     if (!items.length) throw new Error('Agrega al menos un producto');
     const nombre = $('#cliente').value.trim();
     if (tipo !== 'contado' && !nombre) throw new Error('Para fiado, pedido o regalo escribe el nombre del cliente');
-    // Leer todo antes de guardar: si cambia la pantalla a mitad de camino, igual se guarda bien
-    const venta = {
+    const total = items.reduce((s, i) => s + i.cantidad * i.precio, 0);
+    // El cliente va por nombre: si es nuevo, Supabase lo crea al subir la venta
+    const r = await operar('venta', {
       tipo,
+      cliente_nombre: nombre || null,
       fecha_compromiso: $('#compromiso')?.value || null,
-      viaje_id: viaje && $('#desde-camion')?.checked ? viaje.id : null,
+      viaje_ref: viaje && $('#desde-camion')?.checked ? viaje.ref : null,
       pagado: n($('#pagado')?.value),
       nota: $('#nota').value.trim() || null,
       items: items.map(({ producto_id, cantidad, precio }) => ({ producto_id, cantidad, precio })),
-    };
-    let cliente = nombre ? buscarCliente(nombre) : null;
-    if (nombre && !cliente) cliente = await q(sb.from('clientes').insert({ nombre }).select().single());
-    const total = items.reduce((s, i) => s + i.cantidad * i.precio, 0);
-    await q(sb.rpc('registrar_venta', { p: { ...venta, cliente_id: cliente?.id ?? null } }));
-    aviso(tipo === 'regalo' ? 'Regalo guardado' : `Venta guardada: ${bs(total)}`);
+    }, `${TIPOS[tipo]} a ${nombre || 'cliente de paso'}: ${bs(tipo === 'regalo' ? 0 : total)}`);
+    avisoGuardado(r, tipo === 'regalo' ? 'Regalo guardado' : `Venta guardada: ${bs(total)}`);
     vender();
   });
 
@@ -742,11 +886,17 @@ async function vender() {
 // Cobrar
 // =====================================================================
 
+const cargarCobrar = () => Promise.all([
+  todas(() => sb.from('v_saldos').select('*')),
+  viajeAbierto(),
+]);
+
 async function cobrar() {
-  const [saldos, viaje] = await Promise.all([
-    todas(() => sb.from('v_saldos').select('*').gt('saldo', 0.009).order('saldo', { ascending: false })),
-    viajeAbierto(),
-  ]);
+  const [todosLosSaldos, viaje] = await cargarCobrar();
+  const saldos = todosLosSaldos
+    .map(c => ({ ...c, saldo: saldoCliente({ id: c.cliente_id, nombre: c.nombre }, c.saldo) }))
+    .filter(c => c.saldo > 0.009)
+    .sort((a, b) => b.saldo - a.saldo);
   const total = saldos.reduce((s, c) => s + n(c.saldo), 0);
 
   pantalla('cobrar', 'Cobrar', `
@@ -790,12 +940,13 @@ async function cobrar() {
       const saldo = n(form.dataset.saldo);
       if (monto <= 0) throw new Error('Pon el monto');
       if (monto > saldo + 0.001 && !confirm(`Debe ${bs(saldo)} y estás cobrando ${bs(monto)}. ¿Seguro?`)) return;
-      await q(sb.from('pagos').insert({
+      const nombre = form.closest('.tarjeta').querySelector('b').textContent;
+      const r = await operar('pago', {
         cliente_id: +form.dataset.cliente,
         monto,
-        viaje_id: viaje && $('#desde-camion')?.checked ? viaje.id : null,
-      }));
-      aviso(`Cobro de ${bs(monto)} guardado`);
+        viaje_ref: viaje && $('#desde-camion')?.checked ? viaje.ref : null,
+      }, `Cobro a ${nombre}: ${bs(monto)}`);
+      avisoGuardado(r, `Cobro de ${bs(monto)} guardado`);
       cobrar();
     });
   });
@@ -807,14 +958,16 @@ async function cobrar() {
 
 async function camion() {
   const viaje = await viajeAbierto();
-  return viaje ? camionEnRuta(viaje.id) : camionSalida();
+  return viaje ? camionEnRuta(viaje) : camionSalida();
 }
 
+const cargarCamionSalida = () => Promise.all([
+  opcionesConStock(),
+  q(sb.from('viajes').select('*').not('regreso', 'is', null).order('id', { ascending: false }).limit(5)).catch(() => []),
+]);
+
 async function camionSalida() {
-  const [{ opciones }, anteriores] = await Promise.all([
-    opcionesConStock(),
-    q(sb.from('viajes').select('*').not('regreso', 'is', null).order('id', { ascending: false }).limit(5)),
-  ]);
+  const [{ opciones }, anteriores] = await cargarCamionSalida();
   const carga = [];
   let actual = null;
   let sel;
@@ -861,16 +1014,12 @@ async function camionSalida() {
       : '<p class="nota">Elige los productos que suben al camión.</p>';
     $$('[data-quitar]').forEach(b => b.onclick = () => { carga.splice(+b.dataset.quitar, 1); dibujarCarga(); });
     if (carga.length) $('#salir-camion').onclick = () => conEspera($('#salir-camion'), async () => {
-      const viaje = await q(sb.from('viajes').insert({}).select().single());
       const filas = {};
-      for (const c of carga) filas[c.producto_id] = (filas[c.producto_id] || 0) + c.cantidad;
-      try {
-        await q(sb.from('viaje_carga').insert(Object.entries(filas).map(([id, c]) => ({ viaje_id: viaje.id, producto_id: +id, cargado: c }))));
-      } catch (err) {
-        await sb.from('viajes').delete().eq('id', viaje.id);
-        throw err;
-      }
-      aviso('Camión en ruta');
+      for (const c of carga) (filas[c.producto_id] ??= { producto_id: c.producto_id, nombre: c.nombre, cantidad: 0 }).cantidad += c.cantidad;
+      // El viaje lleva un código creado aquí, así se puede vender en ruta aunque no haya internet
+      const r = await operar('salida', { viaje_ref: crypto.randomUUID(), carga: Object.values(filas) },
+        `Salida del camión (${Object.keys(filas).length} producto(s))`);
+      avisoGuardado(r, 'Camión en ruta');
       camion();
     });
   };
@@ -890,16 +1039,36 @@ async function camionSalida() {
   dibujarCarga();
 }
 
-async function camionEnRuta(viajeId) {
-  const [viaje, carga, vendidos, pagos] = await Promise.all([
-    q(sb.from('viajes').select('*').eq('id', viajeId).single()),
-    q(sb.from('viaje_carga').select('*, productos(nombre, unidad)').eq('viaje_id', viajeId)),
-    todas(() => sb.from('venta_items').select('producto_id, cantidad, ventas!inner(viaje_id)').eq('ventas.viaje_id', viajeId)),
-    q(sb.from('pagos').select('monto').eq('viaje_id', viajeId)),
-  ]);
+async function camionEnRuta(viaje) {
+  // Lo que ya está en Supabase (si el viaje se subió) + lo de este viaje que sigue en la cola
+  let carga;
+  let vendidos = [];
+  let pagos = [];
+  if (viaje.local) {
+    carga = viaje.carga.map(c => ({ producto_id: c.producto_id, nombre: c.nombre, cargado: n(c.cantidad) }));
+  } else {
+    let filas;
+    [filas, vendidos, pagos] = await Promise.all([
+      q(sb.from('viaje_carga').select('producto_id, cargado, productos(nombre)').eq('viaje_id', viaje.id)),
+      todas(() => sb.from('venta_items').select('producto_id, cantidad, ventas!inner(viaje_id)').eq('ventas.viaje_id', viaje.id)),
+      q(sb.from('pagos').select('monto').eq('viaje_id', viaje.id)),
+    ]);
+    carga = filas.map(c => ({ producto_id: c.producto_id, nombre: c.productos.nombre, cargado: n(c.cargado) }));
+  }
   const vendido = {};
   for (const v of vendidos) vendido[v.producto_id] = (vendido[v.producto_id] || 0) + n(v.cantidad);
-  const esperado = pagos.reduce((s, p) => s + n(p.monto), 0);
+  let esperado = pagos.reduce((s, p) => s + n(p.monto), 0);
+  let hayVentas = vendidos.length > 0;
+  for (const { tipo, datos: d } of leerCola()) {
+    if (d.viaje_ref !== viaje.ref) continue;
+    if (tipo === 'venta') {
+      hayVentas = true;
+      d.items.forEach(i => (vendido[i.producto_id] = (vendido[i.producto_id] || 0) + n(i.cantidad)));
+      const total = d.items.reduce((t, i) => t + n(i.cantidad) * n(i.precio), 0);
+      esperado += d.tipo === 'contado' ? total : d.tipo === 'regalo' ? 0 : Math.min(n(d.pagado), total);
+    }
+    if (tipo === 'pago') esperado += n(d.monto);
+  }
 
   pantalla('camion', 'Camión en ruta', `
     <p class="nota">Salió: ${fechaHora(viaje.salida)} · Las ventas marcadas "desde el camión" se van sumando aquí.</p>
@@ -907,9 +1076,9 @@ async function camionEnRuta(viajeId) {
       <table>
         <thead><tr><th>Producto</th><th class="n">Cargó</th><th class="n">Vendió</th><th class="n">Volvió</th></tr></thead>
         <tbody>${carga.map(c => {
-          const debe = Math.max(0, n(c.cargado) - (vendido[c.producto_id] || 0));
+          const debe = Math.max(0, c.cargado - (vendido[c.producto_id] || 0));
           return `<tr>
-            <td>${esc(c.productos.nombre)}</td>
+            <td>${esc(c.nombre)}</td>
             <td class="n">${cant(c.cargado)}</td>
             <td class="n">${cant(vendido[c.producto_id] || 0)}</td>
             <td class="n"><input type="number" step="any" min="0" inputmode="decimal" data-producto="${c.producto_id}" data-debe="${debe}" value="${debe}"></td>
@@ -925,11 +1094,11 @@ async function camionEnRuta(viajeId) {
       <p class="nota" id="dif-plata"></p>
       <button class="btn primario grande">${icono('ok')} Regresó el camión</button>
     </form>
-    ${vendidos.length ? '' : `<button class="btn peligro" id="cancelar" style="width:100%">${icono('cerrar')} Cancelar esta salida</button>`}`);
+    ${hayVentas ? '' : `<button class="btn peligro" id="cancelar" style="width:100%">${icono('cerrar')} Cancelar esta salida</button>`}`);
 
   const revisar = () => {
     const faltan = $$('[data-producto]').map(i => ({
-      nombre: carga.find(c => c.producto_id == i.dataset.producto).productos.nombre,
+      nombre: carga.find(c => c.producto_id == i.dataset.producto).nombre,
       falta: n(i.dataset.debe) - n(i.value),
     })).filter(x => x.falta > 0);
     $('#faltantes').innerHTML = faltan.length
@@ -945,20 +1114,23 @@ async function camionEnRuta(viajeId) {
   $('#f').onsubmit = e => {
     e.preventDefault();
     conEspera($('#f button.primario'), async () => {
-      await q(sb.rpc('cerrar_viaje', {
-        p_viaje: viajeId,
-        p_devueltos: $$('[data-producto]').map(i => ({ producto_id: +i.dataset.producto, devuelto: n(i.value) })),
-        p_efectivo: n($('#efectivo').value),
-        p_marcar: $('#marcar').checked,
-      }));
-      aviso('Viaje cerrado');
+      const r = await operar('regreso', {
+        viaje_ref: viaje.ref,
+        devueltos: $$('[data-producto]').map(i => ({ producto_id: +i.dataset.producto, devuelto: n(i.value) })),
+        efectivo: n($('#efectivo').value),
+        marcar: $('#marcar').checked,
+      }, 'Regreso del camión');
+      avisoGuardado(r, 'Viaje cerrado');
       location.hash = '#inicio';
     });
   };
   const cancelar = $('#cancelar');
   if (cancelar) cancelar.onclick = () => conEspera(cancelar, async () => {
     if (!confirm('¿Cancelar esta salida del camión?')) return;
-    await q(sb.from('viajes').delete().eq('id', viajeId));
+    // Si la salida todavía no se subió, basta con quitarla de la cola
+    const salida = enCola('salida').find(o => o.datos.viaje_ref === viaje.ref);
+    if (salida) { descartar(salida.id); aviso('Salida cancelada'); }
+    else avisoGuardado(await operar('cancelar_salida', { viaje_ref: viaje.ref }, 'Cancelar salida del camión'), 'Salida cancelada');
     camion();
   });
 }
@@ -1002,12 +1174,14 @@ async function gasto() {
     e.preventDefault();
     conEspera(form.querySelector('button.primario'), async () => {
       const d = datos(form);
-      await q(sb.from('gastos').insert({ categoria, monto: n(d.monto), fecha: d.fecha, nota: d.nota.trim() || null }));
-      aviso('Gasto guardado');
+      const r = await operar('gasto', { categoria, monto: n(d.monto), dia: d.fecha, nota: d.nota.trim() || null },
+        `Gasto ${categoria}: ${bs(d.monto)}`);
+      avisoGuardado(r, 'Gasto guardado');
       gasto();
     });
   };
   $$('[data-borrar]').forEach(b => b.onclick = () => conEspera(b, async () => {
+    necesitaInternet();
     if (!confirm('¿Borrar este gasto?')) return;
     await q(sb.from('gastos').delete().eq('id', b.dataset.borrar));
     gasto();
@@ -1038,6 +1212,7 @@ async function stock() {
       </div>`).join('') || '<p class="tarjeta">No hay stock. Registra lo que llega en "Llegó mercadería".</p>'}`);
 
   $$('[data-borrar]').forEach(b => b.onclick = () => conEspera(b, async () => {
+    necesitaInternet();
     if (!confirm('¿Borrar este lote? Solo se puede si todavía no se vendió nada de él.')) return;
     const { error } = await sb.from('lotes').delete().eq('id', b.dataset.borrar);
     if (error) throw new Error('No se puede borrar: ya tiene ventas o bajas. Usa "Pinchadas / bajas".');
@@ -1098,12 +1273,14 @@ async function baja() {
     conEspera(form.querySelector('button.primario'), async () => {
       const cantidad = n(form.cantidad.value);
       if (cantidad <= 0) throw new Error('Pon una cantidad');
-      await q(sb.rpc('registrar_baja', { p_producto: actual.producto_id, p_cantidad: cantidad, p_motivo: motivo, p_nota: form.nota.value.trim() || null }));
-      aviso('Baja registrada');
+      const r = await operar('baja', { producto_id: actual.producto_id, cantidad, motivo, nota: form.nota.value.trim() || null },
+        `Baja (${MOTIVOS[motivo]}): ${cant(cantidad)} ${nombreProducto(actual)}`);
+      avisoGuardado(r, 'Baja registrada');
       baja();
     });
   };
   $$('[data-borrar]').forEach(b => b.onclick = () => conEspera(b, async () => {
+    necesitaInternet();
     if (!confirm('¿Deshacer esta baja? La mercadería vuelve al stock.')) return;
     await q(sb.from('bajas').delete().eq('id', b.dataset.borrar));
     baja();
@@ -1148,6 +1325,7 @@ async function historial() {
 
   $$('[data-dias]').forEach(b => b.onclick = () => { guardar('dias-historial', b.dataset.dias); historial(); });
   $$('[data-anular]').forEach(b => b.onclick = () => conEspera(b, async () => {
+    necesitaInternet();
     if (!confirm('¿Anular esta venta? La mercadería vuelve al stock y se borra lo pagado en ella.')) return;
     await q(sb.from('ventas').delete().eq('id', b.dataset.anular));
     aviso('Venta anulada');
@@ -1163,8 +1341,9 @@ async function pedidos() {
   const lista = await q(sb.from('ventas')
     .select('id, fecha, tipo, total, fecha_compromiso, nota, cliente_id, clientes(nombre), venta_items(cantidad, precio, productos(nombre)), pagos(monto)')
     .eq('tipo', 'pedido').eq('entregado', false).order('fecha_compromiso'));
+  const entregadosEnCola = new Set(enCola('entregar').map(o => o.datos.venta_id));
 
-  pantalla('pedidos', 'Pedidos por entregar', lista.map(v => {
+  pantalla('pedidos', 'Pedidos por entregar', lista.filter(v => !entregadosEnCola.has(v.id)).map(v => {
     const pagado = v.pagos.reduce((s, p) => s + n(p.monto), 0);
     const falta = n(v.total) - pagado;
     return tarjetaVenta(v, `
@@ -1176,11 +1355,12 @@ async function pedidos() {
   }).join('') || '<p class="tarjeta">No hay pedidos pendientes.</p>');
 
   $$('[data-entregar]').forEach(b => b.onclick = () => conEspera(b, async () => {
-    if (b.dataset.cobrar) {
-      await q(sb.from('pagos').insert({ cliente_id: +b.dataset.cliente, venta_id: +b.dataset.entregar, monto: n(b.dataset.cobrar) }));
-    }
-    await q(sb.from('ventas').update({ entregado: true }).eq('id', b.dataset.entregar));
-    aviso('Pedido entregado');
+    const r = await operar('entregar', {
+      venta_id: +b.dataset.entregar,
+      cliente_id: b.dataset.cliente ? +b.dataset.cliente : null,
+      cobrar: n(b.dataset.cobrar),
+    }, 'Entrega de pedido');
+    avisoGuardado(r, 'Pedido entregado');
     pedidos();
   }));
 }
@@ -1224,6 +1404,7 @@ async function productos(id) {
   if (form) form.onsubmit = e => {
     e.preventDefault();
     conEspera(form.querySelector('button'), async () => {
+      necesitaInternet();
       const d = datos(form);
       const fila = { marca: d.marca.trim(), presentacion: d.presentacion.trim() || null, sabor: d.sabor.trim() || null };
       await q(sb.from('productos').update({
@@ -1272,6 +1453,7 @@ async function clientes(id) {
   form.onsubmit = e => {
     e.preventDefault();
     conEspera(form.querySelector('button'), async () => {
+      necesitaInternet();
       const d = datos(form);
       await q(sb.from('clientes').insert({ nombre: d.nombre.trim(), telefono: d.telefono.trim() || null, deuda_inicial: n(d.deuda_inicial) }));
       aviso('Cliente guardado');
@@ -1313,6 +1495,7 @@ async function cliente(id) {
   form.onsubmit = e => {
     e.preventDefault();
     conEspera(form.querySelector('button'), async () => {
+      necesitaInternet();
       const d = datos(form);
       await q(sb.from('clientes').update({
         nombre: d.nombre.trim(), telefono: d.telefono.trim() || null, deuda_inicial: n(d.deuda_inicial), notas: d.notas.trim() || null,
@@ -1328,6 +1511,7 @@ async function cliente(id) {
 // =====================================================================
 
 function login() {
+  app.dataset.seccion = 'vender';
   app.innerHTML = `
     <div class="login">
       <div class="logo">${icono('llego')}</div>
@@ -1342,24 +1526,70 @@ function login() {
   form.onsubmit = e => {
     e.preventDefault();
     conEspera(form.querySelector('button'), async () => {
+      if (sinInternet()) throw new Error('Para entrar la primera vez necesitas internet.');
       const { error } = await sb.auth.signInWithPassword(datos(form));
       if (error) throw new Error('Correo o contraseña incorrectos');
+      precargar();
       navegar();
     });
   };
 }
 
-const rutas = { inicio, llego, vender, cobrar, camion, gasto, stock, baja, historial, pedidos, productos, clientes };
+// =====================================================================
+// Cambios pendientes de subir
+// =====================================================================
+
+async function pendientes() {
+  const cola = leerCola();
+  pantalla('alerta', 'Cambios por subir', `
+    <p class="nota">${sinInternet() ? 'Sin internet: se subirán solos cuando vuelva la señal.' : 'Con internet se suben solos en unos segundos.'}</p>
+    ${cola.map(o => `
+      <div class="tarjeta">
+        <div class="item"><div class="info"><b>${esc(o.descripcion || o.tipo)}</b>
+          <small>${fechaHora(o.datos.fecha)}</small>
+          ${o.error ? `<small class="negativo">No se pudo subir: ${esc(o.error)}</small>` : '<span class="etiqueta amarilla">esperando internet</span>'}</div></div>
+        ${o.error ? `<div class="fila2">
+          <button data-reintentar="${o.id}">Reintentar</button>
+          <button class="peligro" data-descartar="${o.id}">Descartar</button></div>` : ''}
+      </div>`).join('') || '<p class="tarjeta">Todo está subido.</p>'}
+    ${cola.some(o => !o.error) && !sinInternet() ? '<button class="btn primario grande" id="subir">Subir ahora</button>' : ''}`);
+
+  $$('[data-reintentar]').forEach(b => b.onclick = () => conEspera(b, async () => { await reintentar(b.dataset.reintentar); pendientes(); }));
+  $$('[data-descartar]').forEach(b => b.onclick = () => {
+    if (!confirm('¿Descartar este cambio? No se va a guardar.')) return;
+    descartar(b.dataset.descartar);
+    pendientes();
+  });
+  if ($('#subir')) $('#subir').onclick = () => conEspera($('#subir'), async () => { await sincronizar(); pendientes(); });
+}
+
+// =====================================================================
+// Arranque
+// =====================================================================
+
+// Con internet, se abren en segundo plano los datos de las pantallas principales
+// para que queden guardados y la app funcione si después se corta la señal.
+async function precargar() {
+  if (sinInternet()) return;
+  await Promise.allSettled([cargarVender(), cargarCobrar(), cargarCamionSalida(), cargarLlego(), inicioDatos(leer('periodo', 'mes'))]);
+}
+
+const rutas = { inicio, llego, vender, cobrar, camion, gasto, stock, baja, historial, pedidos, productos, clientes, pendientes };
 
 async function navegar() {
-  const { data: { session } } = await sb.auth.getSession();
+  let { data: { session } } = await sb.auth.getSession().catch(() => ({ data: {} }));
+  // Sin internet el token puede estar vencido y no se puede renovar: se sigue con los datos guardados
+  if (!session && sinInternet() && Object.keys(localStorage).some(k => k.startsWith('sb-') && k.endsWith('-auth-token'))) session = true;
   if (!session) return login();
   const [ruta, param] = location.hash.slice(1).split('/');
-  app.innerHTML = '<p class="cargando">Cargando…</p>';
+  app.innerHTML = CARGANDO;
   try {
     await (rutas[ruta] || inicio)(param);
   } catch (e) {
-    pantalla('alerta', 'Algo salió mal', `<p class="tarjeta error">${esc(e.message || e)}</p><p class="nota">Revisa tu conexión a internet y vuelve a intentar.</p>`);
+    const texto = sinInternet()
+      ? 'No hay internet y esta pantalla todavía no se había abierto con internet en este aparato. Ábrela una vez con señal y después funcionará sin internet.'
+      : esc(e.message || e);
+    pantalla('alerta', sinInternet() ? 'Sin internet' : 'Algo salió mal', `<p class="tarjeta">${texto}</p>`);
   }
   window.scrollTo(0, 0);
 }
@@ -1370,8 +1600,14 @@ function arrancar() {
       <p>Abre <b>js/config.js</b> y pega la URL y la anon key de tu proyecto de Supabase.</p></div>`;
     return;
   }
-  navegar();
+  iniciarCola(sb, cola => {
+    dibujarEstado(cola);
+    // Cuando termina de subir, refrescar la pantalla para mostrar los datos al día
+    if (!cola.length && location.hash === '#pendientes') pendientes();
+  });
+  window.addEventListener('hashchange', navegar);
+  window.addEventListener('online', () => precargar());
+  navegar().then(() => setTimeout(precargar, 1500));
 }
 
-if (configurado) window.addEventListener('hashchange', navegar);
 arrancar();

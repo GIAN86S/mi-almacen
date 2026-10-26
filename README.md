@@ -4,6 +4,9 @@ App web para controlar el almacén de bebidas desde el celular: lotes que llegan
 
 - **Página:** HTML + JavaScript sin compilar (se publica tal cual en GitHub Pages).
 - **Datos:** Supabase (Postgres). Toda la lógica de stock y deudas está en `supabase/esquema.sql`.
+- **Se instala** en celular y PC (Chrome/Edge: botón "Instalar en este aparato") y **funciona sin internet**:
+  lo guardado sin señal queda en `localStorage` (`js/cola.js`) y se sube solo con `aplicar_operacion()`;
+  `sw.js` guarda la app y los últimos datos vistos. Al cambiar archivos, subir `VERSION` en `sw.js`.
 
 ## Puesta en marcha
 

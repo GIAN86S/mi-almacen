@@ -1,11 +1,19 @@
 {
+  "id": "./",
   "name": "Mi Almacén",
   "short_name": "Almacén",
+  "description": "Control del almacén de bebidas: llegadas, ventas, cobros, camión y ganancias.",
+  "lang": "es",
   "start_url": "./",
+  "scope": "./",
   "display": "standalone",
+  "orientation": "any",
   "background_color": "#f4f6f5",
   "theme_color": "#0f6b4f",
   "icons": [
+    { "src": "iconos/icono-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "iconos/icono-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "iconos/icono-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" },
     { "src": "icono.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
   ]
 }
