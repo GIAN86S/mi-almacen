@@ -151,6 +151,7 @@ td input { padding: 8px; margin: 0; min-width: 70px; text-align: right; }
   max-width: calc(100% - 32px); width: max-content;
   background: var(--texto); color: var(--fondo); padding: 12px 18px; border-radius: 12px;
   font-weight: 600; transition: transform .25s; z-index: 10;
+  pointer-events: none; /* que nunca tape un botón */
 }
 #aviso.ver { transform: translateX(-50%) translateY(0); }
 #aviso.mal { background: var(--mal); color: #fff; }
