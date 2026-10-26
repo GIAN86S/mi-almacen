@@ -10,6 +10,7 @@ App web para controlar el almacén de bebidas desde el celular: lotes que llegan
 ### 1. Supabase
 1. Crear un proyecto en <https://supabase.com>.
 2. **SQL Editor → New query**, pegar todo `supabase/esquema.sql` y **Run**.
+   (Si el proyecto se creó con una versión anterior, correr también los archivos `supabase/migracion-*.sql` en orden.)
 3. **Authentication → Users → Add user → Create new user**: correo y contraseña de Rafael (marcar *Auto confirm user*).
 4. **Authentication → Sign In / Providers → Email**: desactivar **Allow new users to sign up**, para que nadie más pueda crear cuenta.
 5. **Project Settings → API**: copiar **Project URL** y **anon public key**.
@@ -26,11 +27,13 @@ Pegar esos dos valores en `js/config.js`.
 
 | Botón | Qué hace |
 |---|---|
-| 📦 Llegó mercadería | Registra un lote: cantidad pagada, **de regalo**, costo, flete y vencimiento. Calcula el costo real por unidad. |
-| 🛒 Vender | Sugiere **el precio de ese cliente** (o el general). Sale primero el lote que vence antes. Avisa si se vende bajo costo. Contado, **fiado** (con fecha de pago), **pedido** (se entrega después, queda apartado) o **regalo**. |
-| 💵 Cobrar | Lista quién debe y desde cuándo. Los cobros pagan primero la deuda más vieja. Recordatorio por WhatsApp. |
-| 🚚 Camión | Salida: lo que se carga. Regreso: lo que volvió; lo que falta se cuenta como pinchado y se cuadra la plata. |
-| 🧾 Gasto | Flete, combustible, sueldos, alquiler, depósito… |
+| Llegó mercadería | Varios productos por llegada, elegidos tocando **Marca → Presentación → Sabor**. Cantidad pagada, **de regalo**, costo y vencimiento; el flete de toda la llegada se reparte solo. |
+| Vender | Sugiere **el precio de ese cliente** (o el general). Sale primero el lote que vence antes. Avisa si se vende bajo costo. Contado, **fiado** (con fecha de pago), **pedido** (se entrega después, queda apartado) o **regalo**. |
+| Cobrar | Lista quién debe y desde cuándo. Los cobros pagan primero la deuda más vieja. Recordatorio por WhatsApp. |
+| Camión | Salida: lo que se carga. Regreso: lo que volvió; lo que falta se cuenta como pinchado y se cuadra la plata. |
+| Gasto | Flete, combustible, sueldos, alquiler, depósito… |
+
+El catálogo de partida (marcas, presentaciones, sabores, costos y precios sugeridos) está en `js/catalogo.js`.
 
 **Ganancia real** = ventas − costo de lo vendido − regalos − pinchadas/vencidas − gastos.
 

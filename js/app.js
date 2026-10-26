@@ -1,5 +1,7 @@
 import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/+esm';
 import { SUPABASE_URL, SUPABASE_ANON_KEY } from './config.js';
+import { icono } from './iconos.js';
+import { opcionesCatalogo, nombreProducto, clave } from './catalogo.js';
 
 const app = document.getElementById('app');
 const configurado = SUPABASE_URL.startsWith('https://') && !SUPABASE_ANON_KEY.startsWith('PEGA');
@@ -70,13 +72,13 @@ async function todas(armar) {
   }
 }
 
-const leer = (clave, defecto) => { try { return localStorage.getItem(clave) ?? defecto; } catch { return defecto; } };
-const guardar = (clave, valor) => { try { localStorage.setItem(clave, valor); } catch { /* sin almacenamiento */ } };
+const leer = (k, defecto) => { try { return localStorage.getItem(k) ?? defecto; } catch { return defecto; } };
+const guardar = (k, valor) => { try { localStorage.setItem(k, valor); } catch { /* sin almacenamiento */ } };
 
-function pantalla(titulo, html, volver = '#inicio') {
+function pantalla(ico, titulo, html, volver = '#inicio') {
   app.innerHTML = `
-    <div class="barra">${volver ? `<a class="volver" href="${volver}">← Volver</a>` : ''}</div>
-    <h1>${titulo}</h1>
+    ${volver ? `<a class="volver" href="${volver}">${icono('volver')} Volver</a>` : ''}
+    <h1>${ico ? icono(ico) : ''}${titulo}</h1>
     ${html}`;
 }
 
@@ -115,6 +117,144 @@ async function stockDisponible() {
     p.lotes.push(l);
   }
   return { lotes, porProducto };
+}
+
+// Productos que hay en stock, listos para el selector
+async function opcionesConStock() {
+  const [productos, stock] = await Promise.all([
+    q(sb.from('productos').select('*').eq('activo', true)),
+    stockDisponible(),
+  ]);
+  const opciones = productos.filter(p => stock.porProducto[p.id]).map(p => ({
+    producto_id: p.id,
+    marca: p.marca || p.nombre,
+    presentacion: p.presentacion || '',
+    sabor: p.sabor || '',
+    unidad: p.unidad,
+    precio: n(p.precio_general) || null,
+    stock: stock.porProducto[p.id].restante,
+    costo: stock.porProducto[p.id].costoPrimero,
+    nombre: p.nombre,
+  }));
+  return { opciones, stock, productos };
+}
+
+// =====================================================================
+// Selector por toques: Marca → Presentación → Sabor
+// =====================================================================
+
+function selector(cont, opciones, { alElegir, conStock = false, otro = null }) {
+  let marca = null;
+  let pres = null;
+  let elegida = null;
+
+  const unicas = lista => [...new Set(lista)];
+  const suma = lista => lista.reduce((s, o) => s + n(o.stock), 0);
+  const ordenar = (a, b) => a.localeCompare(b, 'es', { numeric: true });
+  const chip = (accion, valor, texto, extra = '') =>
+    `<button type="button" class="opcion" data-accion="${accion}" data-valor="${esc(valor)}">${esc(texto)}${extra ? `<small>${extra}</small>` : ''}</button>`;
+  const stockDe = lista => conStock ? `quedan ${cant(suma(lista))}` : '';
+
+  function dibujar() {
+    const deMarca = opciones.filter(o => o.marca === marca);
+    const dePres = deMarca.filter(o => o.presentacion === pres);
+    let migas = '';
+    let titulo;
+    let botones;
+
+    if (marca) migas += `<button type="button" class="miga" data-accion="ir-todas">Marcas</button><span>›</span><button type="button" class="miga" data-accion="ir-marca">${esc(marca)}</button>`;
+    if (pres !== null && pres !== '') migas += `<span>›</span><button type="button" class="miga" data-accion="ir-pres">${esc(pres)}</button>`;
+
+    if (elegida) {
+      titulo = 'Producto elegido';
+      botones = `<div class="elegido">${icono('ok')} ${esc(nombreProducto(elegida))}
+        <button type="button" class="chico" data-accion="ir-sabor">Cambiar</button></div>`;
+    } else if (!marca) {
+      titulo = 'Marca';
+      botones = unicas(opciones.map(o => o.marca)).sort(ordenar)
+        .map(m => chip('marca', m, m, stockDe(opciones.filter(o => o.marca === m)))).join('')
+        + (otro ? `<button type="button" class="opcion otro" data-accion="otro">${icono('mas')} Otro producto</button>` : '');
+    } else if (pres === null) {
+      titulo = 'Presentación';
+      botones = unicas(deMarca.map(o => o.presentacion)).sort(ordenar)
+        .map(p => chip('pres', p, p, stockDe(deMarca.filter(o => o.presentacion === p)))).join('');
+    } else {
+      titulo = 'Sabor';
+      botones = dePres.map((o, i) => chip('sabor', i, o.sabor || 'Único', conStock ? `quedan ${cant(o.stock)}` : '')).join('');
+    }
+
+    cont.innerHTML = `
+      ${migas ? `<div class="migas">${migas}</div>` : ''}
+      <p class="paso">${titulo}</p>
+      <div class="opciones">${botones || '<p class="nota">No hay productos.</p>'}</div>`;
+  }
+
+  function avanzar() {
+    elegida = null;
+    if (marca && pres === null) {
+      const ps = unicas(opciones.filter(o => o.marca === marca).map(o => o.presentacion));
+      if (ps.length === 1) pres = ps[0];
+    }
+    if (marca && pres !== null) {
+      const dePres = opciones.filter(o => o.marca === marca && o.presentacion === pres);
+      if (dePres.length === 1) return elegir(dePres[0]);
+    }
+    dibujar();
+  }
+
+  function elegir(o) {
+    elegida = o;
+    dibujar();
+    alElegir(o);
+  }
+
+  cont.onclick = e => {
+    const b = e.target.closest('[data-accion]');
+    if (!b) return;
+    const { accion, valor } = b.dataset;
+    if (accion === 'marca') { marca = valor; pres = null; avanzar(); }
+    else if (accion === 'pres') { pres = valor; avanzar(); }
+    else if (accion === 'sabor') elegir(opciones.filter(o => o.marca === marca && o.presentacion === pres)[+valor]);
+    else if (accion === 'ir-todas') { marca = null; pres = null; elegida = null; dibujar(); alElegir(null); }
+    else if (accion === 'ir-marca') { pres = null; elegida = null; dibujar(); alElegir(null); }
+    else if (accion === 'ir-pres' || accion === 'ir-sabor') { elegida = null; dibujar(); alElegir(null); }
+    else if (accion === 'otro') otro();
+  };
+
+  dibujar();
+  return {
+    // Después de agregar un producto, volver a los sabores de la misma presentación
+    reiniciar() {
+      elegida = null;
+      const quedan = opciones.filter(o => o.marca === marca && o.presentacion === pres);
+      if (quedan.length <= 1) { marca = null; pres = null; }
+      dibujar();
+    },
+    actualizar(nuevas) { opciones = nuevas; },
+  };
+}
+
+// Cantidad con botones grandes de − y +
+const campoCantidad = (rotulo, nombre = 'cantidad', valor = '') => `
+  <div class="campo">
+    <span class="rotulo">${rotulo}</span>
+    <div class="stepper">
+      <button type="button" data-paso="-1" aria-label="Menos">${icono('menos')}</button>
+      <input name="${nombre}" type="number" step="any" min="0" inputmode="decimal" value="${valor}" aria-label="${rotulo}">
+      <button type="button" data-paso="1" aria-label="Más">${icono('mas')}</button>
+    </div>
+    <div class="rapidos">${[5, 10, 20, 50].map(v => `<button type="button" class="chico" data-suma="${v}">+${v}</button>`).join('')}</div>
+  </div>`;
+
+function activarCantidad(cont, alCambiar = () => {}) {
+  cont.addEventListener('click', e => {
+    const b = e.target.closest('[data-paso],[data-suma]');
+    if (!b) return;
+    const input = b.closest('.campo').querySelector('input');
+    const nuevo = Math.max(0, n(input.value) + n(b.dataset.paso ?? b.dataset.suma));
+    input.value = nuevo;
+    alCambiar();
+  });
 }
 
 // =====================================================================
@@ -164,20 +304,20 @@ async function inicio() {
 
   const nombres = { hoy: 'Hoy', semana: '7 días', mes: 'Este mes', todo: 'Todo' };
   const alertas = [
-    viaje && `<a class="alerta verde" href="#camion">🚚 El camión está en ruta desde ${fechaHora(viaje.salida)}. Toca aquí al regresar.</a>`,
-    porVencer.length && `<a class="alerta roja" href="#stock">⚠️ ${porVencer.length} lote(s) vencen en 30 días o menos (${bs(valorPorVencer)}). ¡Véndelos primero!</a>`,
-    atrasados && `<a class="alerta roja" href="#cobrar">💸 ${atrasados} cliente(s) pasaron su fecha de pago.</a>`,
-    pedidos.length && `<a class="alerta amarilla" href="#pedidos">📋 ${pedidos.length} pedido(s) por entregar.</a>`,
+    viaje && `<a class="alerta verde" href="#camion">${icono('camion')}<span>El camión está en ruta desde ${fechaHora(viaje.salida)}. Toca aquí al regresar.</span></a>`,
+    porVencer.length && `<a class="alerta roja" href="#stock">${icono('alerta')}<span>${porVencer.length} lote(s) vencen en 30 días o menos (${bs(valorPorVencer)}). ¡Véndelos primero!</span></a>`,
+    atrasados && `<a class="alerta roja" href="#cobrar">${icono('cobrar')}<span>${atrasados} cliente(s) pasaron su fecha de pago.</span></a>`,
+    pedidos.length && `<a class="alerta amarilla" href="#pedidos">${icono('pedidos')}<span>${pedidos.length} pedido(s) por entregar.</span></a>`,
   ].filter(Boolean).join('');
 
   app.innerHTML = `
     <h1>Mi Almacén</h1>
     <div class="menu">
-      <a class="ancho" href="#vender"><span>🛒</span> VENDER</a>
-      <a href="#llego"><span>📦</span>Llegó mercadería</a>
-      <a href="#cobrar"><span>💵</span>Cobrar</a>
-      <a href="#camion"><span>🚚</span>Camión</a>
-      <a href="#gasto"><span>🧾</span>Gasto</a>
+      <a class="ancho" href="#vender">${icono('vender')} VENDER</a>
+      <a href="#llego">${icono('llego')}Llegó mercadería</a>
+      <a href="#cobrar">${icono('cobrar')}Cobrar</a>
+      <a href="#camion">${icono('camion')}Camión</a>
+      <a href="#gasto">${icono('gasto')}Gasto</a>
     </div>
     ${alertas}
     <div class="chips">
@@ -207,69 +347,69 @@ async function inicio() {
       </ul>
     </div>
     <div class="menu">
-      <a href="#stock"><span>📊</span>Stock y vencimientos</a>
-      <a href="#historial"><span>📒</span>Ventas</a>
-      <a href="#pedidos"><span>📋</span>Pedidos</a>
-      <a href="#clientes"><span>👥</span>Clientes</a>
-      <a href="#productos"><span>🥤</span>Productos</a>
-      <a href="#baja"><span>🗑️</span>Pinchadas / bajas</a>
+      <a href="#stock">${icono('stock')}Stock y vencimientos</a>
+      <a href="#historial">${icono('ventas')}Ventas</a>
+      <a href="#pedidos">${icono('pedidos')}Pedidos</a>
+      <a href="#clientes">${icono('clientes')}Clientes</a>
+      <a href="#productos">${icono('productos')}Productos</a>
+      <a href="#baja">${icono('baja')}Pinchadas / bajas</a>
     </div>
-    <button class="btn" id="salir" style="width:100%">Cerrar sesión</button>`;
+    <button class="btn" id="salir" style="width:100%">${icono('salir')} Cerrar sesión</button>`;
 
   $$('[data-periodo]').forEach(b => b.onclick = () => { guardar('periodo', b.dataset.periodo); inicio(); });
   $('#salir').onclick = async () => { await sb.auth.signOut(); login(); };
 }
 
 // =====================================================================
-// Llegó mercadería (nuevo lote)
+// Llegó mercadería: varios productos en una sola llegada
 // =====================================================================
 
 async function llego() {
-  const [productos, ultimos] = await Promise.all([
-    q(sb.from('productos').select('*').eq('activo', true).order('nombre')),
+  const [productos, ultimosLotes, recientes] = await Promise.all([
+    q(sb.from('productos').select('*')),
+    q(sb.from('lotes').select('producto_id, costo_unit').order('id', { ascending: false }).limit(500)),
     q(sb.from('v_stock_lotes').select('*').order('id', { ascending: false }).limit(10)),
   ]);
-  const buscar = nombre => productos.find(p => p.nombre.trim().toLowerCase() === nombre.trim().toLowerCase());
 
-  pantalla('📦 Llegó mercadería', `
-    <form id="f" class="tarjeta" autocomplete="off">
-      <label>Producto
-        <input name="producto" list="lista-prod" required placeholder="Ej: Mendocina Cola 3 L">
-      </label>
-      <datalist id="lista-prod">${productos.map(p => `<option value="${esc(p.nombre)}">`).join('')}</datalist>
-      <div id="nuevo" hidden>
-        <p class="nota">Producto nuevo. Completa:</p>
-        <div class="fila2">
-          <label>Unidad
-            <select name="unidad">
-              <option value="paq">Paquete</option><option value="cja">Caja</option>
-              <option value="fardo">Fardo</option><option value="und">Unidad</option>
-            </select>
-          </label>
-          <label>Precio de venta general
-            <input name="precio_general" type="number" step="any" min="0" inputmode="decimal">
-          </label>
-        </div>
-      </div>
-      <div class="fila2">
-        <label>Cantidad pagada <input name="cant_pagada" type="number" step="any" min="0" inputmode="decimal" required></label>
-        <label>De regalo (bonificación) <input name="cant_regalo" type="number" step="any" min="0" inputmode="decimal" value="0"></label>
-      </div>
+  // Último costo pagado por producto
+  const ultimoCosto = {};
+  for (const l of ultimosLotes) ultimoCosto[l.producto_id] ??= n(l.costo_unit);
+
+  // Catálogo + productos ya registrados (los registrados mandan)
+  const porClave = new Map(opcionesCatalogo().map(o => [clave(o), { ...o, sabor: o.sabor || '' }]));
+  for (const p of productos.filter(p => p.activo)) {
+    const o = { marca: p.marca || p.nombre, presentacion: p.presentacion || '', sabor: p.sabor || '' };
+    const k = clave(o);
+    const base = porClave.get(k) || {};
+    porClave.set(k, {
+      ...base, ...o, producto_id: p.id, unidad: p.unidad,
+      precio: n(p.precio_general) || base.precio || null,
+      costo: ultimoCosto[p.id] ?? base.costo ?? null,
+    });
+  }
+  let opciones = [...porClave.values()];
+
+  const lineas = [];
+  let actual = null;
+  let sel;
+
+  pantalla('llego', 'Llegó mercadería', `
+    <div class="tarjeta" id="sel"></div>
+    <div id="nuevo"></div>
+    <form id="linea" class="tarjeta" hidden autocomplete="off">
+      <p class="paso" id="linea-nombre"></p>
+      ${campoCantidad('Cantidad pagada', 'cant_pagada')}
+      ${campoCantidad('De regalo (bonificación de la empresa)', 'cant_regalo', 0)}
       <div class="fila2">
         <label>Costo por unidad (Bs) <input name="costo_unit" type="number" step="any" min="0" inputmode="decimal" required></label>
-        <label>Flete y otros (Bs) <input name="flete" type="number" step="any" min="0" inputmode="decimal" value="0"></label>
+        <label>Vence el <input name="vencimiento" type="date"></label>
       </div>
-      <label>Fecha de vencimiento <input name="vencimiento" type="date"></label>
-      <div class="fila2">
-        <label>Proveedor <input name="proveedor" value="${esc(leer('proveedor', 'BBO'))}"></label>
-        <label>Fecha de llegada <input name="fecha" type="date" value="${hoy()}" required></label>
-      </div>
-      <label>Nota <input name="nota" placeholder="opcional"></label>
-      <div id="calculo" class="resumen"></div>
-      <button class="btn primario grande">Guardar lote</button>
+      <label id="campo-precio">Precio de venta general (Bs) <input name="precio" type="number" step="any" min="0" inputmode="decimal"></label>
+      <button class="btn primario grande">${icono('mas')} Agregar a esta llegada</button>
     </form>
+    <div class="tarjeta" id="llegada"></div>
     <h3>Últimos lotes</h3>
-    <div class="tarjeta">${ultimos.length ? ultimos.map(l => `
+    <div class="tarjeta">${recientes.length ? recientes.map(l => `
       <div class="item">
         <div class="info"><b>${esc(l.producto)}</b>
           <small>${fecha(l.fecha)} · ${cant(n(l.cant_pagada) + n(l.cant_regalo))} ${unidad(l.unidad)}${n(l.cant_regalo) ? ` (${cant(l.cant_regalo)} de regalo)` : ''} · quedan ${cant(l.restante)}</small>
@@ -279,48 +419,149 @@ async function llego() {
       </div>`).join('') : '<p class="nota">Todavía no hay lotes.</p>'}
     </div>`);
 
-  const form = $('#f');
-  const calcular = () => {
-    const d = datos(form);
-    $('#nuevo').hidden = !d.producto || !!buscar(d.producto);
-    const total = n(d.cant_pagada) + n(d.cant_regalo);
-    if (!total || !d.costo_unit) { $('#calculo').innerHTML = ''; return; }
-    const pagado = n(d.cant_pagada) * n(d.costo_unit) + n(d.flete);
-    $('#calculo').innerHTML = `
-      <ul class="lineas">
-        <li><span>Entran al almacén</span><b>${cant(total)}</b></li>
-        <li><span>Total pagado</span><b>${bs(pagado)}</b></li>
-        <li class="total"><span>Costo real por unidad</span><b>${bs(pagado / total)}</b></li>
-      </ul>`;
+  const form = $('#linea');
+  activarCantidad(form);
+
+  const elegir = o => {
+    actual = o;
+    form.hidden = !o;
+    if (!o) return;
+    $('#linea-nombre').textContent = `${nombreProducto(o)} · ${unidad(o.unidad)}`;
+    form.cant_pagada.value = '';
+    form.cant_regalo.value = 0;
+    form.costo_unit.value = o.costo ?? '';
+    form.vencimiento.value = lineas.at(-1)?.vencimiento || '';
+    form.precio.value = o.precio ?? '';
+    $('#campo-precio').hidden = !!o.producto_id && !!o.precio;
+    form.cant_pagada.focus();
   };
-  form.oninput = calcular;
+
+  const otro = () => {
+    $('#nuevo').innerHTML = `
+      <form class="tarjeta" id="form-nuevo" autocomplete="off">
+        <p class="paso">Producto nuevo</p>
+        <div class="fila2">
+          <label>Marca <input name="marca" required placeholder="Ej: Coca-Cola"></label>
+          <label>Presentación <input name="presentacion" required placeholder="Ej: 2 L, Lata 473 ml"></label>
+        </div>
+        <div class="fila2">
+          <label>Sabor (opcional) <input name="sabor" placeholder="Ej: Naranja"></label>
+          <label>Se cuenta por
+            <select name="unidad"><option value="paq">Paquete</option><option value="cja">Caja</option>
+              <option value="fardo">Fardo</option><option value="und">Unidad</option></select></label>
+        </div>
+        <button class="btn primario grande">Usar este producto</button>
+      </form>`;
+    const f = $('#form-nuevo');
+    f.marca.focus();
+    f.onsubmit = e => {
+      e.preventDefault();
+      const d = datos(f);
+      const o = { marca: d.marca.trim(), presentacion: d.presentacion.trim(), sabor: d.sabor.trim(), unidad: d.unidad, costo: null, precio: null };
+      const existente = opciones.find(x => clave(x) === clave(o));
+      $('#nuevo').innerHTML = '';
+      if (!existente) { opciones.push(o); sel.actualizar(opciones); }
+      elegir(existente || o);
+      form.scrollIntoView({ behavior: 'smooth' });
+    };
+  };
+
+  sel = selector($('#sel'), opciones, { alElegir: elegir, otro });
+
+  const dibujarLlegada = () => {
+    const valor = lineas.reduce((s, l) => s + l.cant_pagada * l.costo_unit, 0);
+    $('#llegada').innerHTML = lineas.length ? `
+      <p class="paso">Esta llegada (${lineas.length} producto${lineas.length > 1 ? 's' : ''})</p>
+      ${lineas.map((l, i) => `
+        <div class="item">
+          <div class="info"><b>${esc(nombreProducto(l))}</b>
+            <small>${cant(l.cant_pagada)}${l.cant_regalo ? ` + ${cant(l.cant_regalo)} de regalo` : ''} × ${bs(l.costo_unit)}${l.vencimiento ? ' · vence ' + fecha(l.vencimiento) : ''}</small></div>
+          <div class="monto">${bs(l.cant_pagada * l.costo_unit)}</div>
+          <button class="chico peligro" data-quitar="${i}" aria-label="Quitar">${icono('cerrar')}</button>
+        </div>`).join('')}
+      <div class="fila2">
+        <label>Proveedor <input id="proveedor" value="${esc(leer('proveedor', lineas[0].proveedor || 'BBO'))}"></label>
+        <label>Fecha de llegada <input id="fecha" type="date" value="${hoy()}"></label>
+      </div>
+      <label>Flete y gastos de toda la llegada (Bs) <input id="flete" type="number" step="any" min="0" inputmode="decimal" value="0"></label>
+      <p class="nota">El flete se reparte solo entre los productos, según lo que costó cada uno.</p>
+      <ul class="lineas"><li class="total"><span>Total pagado</span><b id="total-llegada">${bs(valor)}</b></li></ul>
+      <button class="btn primario grande" id="guardar">${icono('ok')} Guardar llegada</button>`
+      : '<p class="nota">Elige un producto arriba, pon cuánto llegó y agrégalo. Puedes agregar varios antes de guardar.</p>';
+
+    $$('[data-quitar]').forEach(b => b.onclick = () => { lineas.splice(+b.dataset.quitar, 1); dibujarLlegada(); });
+    if (!lineas.length) return;
+    $('#flete').oninput = () => ($('#total-llegada').textContent = bs(valor + n($('#flete').value)));
+    $('#guardar').onclick = () => conEspera($('#guardar'), guardarLlegada);
+  };
 
   form.onsubmit = e => {
     e.preventDefault();
-    conEspera(form.querySelector('button'), async () => {
-      const d = datos(form);
-      let producto = buscar(d.producto);
-      if (!producto) {
-        producto = await q(sb.from('productos').insert({
-          nombre: d.producto.trim(), unidad: d.unidad, precio_general: n(d.precio_general),
-        }).select().single());
-      }
-      await q(sb.from('lotes').insert({
-        producto_id: producto.id,
-        fecha: d.fecha,
-        proveedor: d.proveedor.trim() || null,
-        cant_pagada: n(d.cant_pagada),
-        cant_regalo: n(d.cant_regalo),
-        costo_unit: n(d.costo_unit),
-        flete: n(d.flete),
-        vencimiento: d.vencimiento || null,
-        nota: d.nota.trim() || null,
-      }));
-      guardar('proveedor', d.proveedor.trim());
-      aviso('Lote guardado ✔');
-      llego();
+    const d = datos(form);
+    if (n(d.cant_pagada) + n(d.cant_regalo) <= 0) return aviso('Pon la cantidad que llegó', true);
+    lineas.push({
+      ...actual,
+      cant_pagada: n(d.cant_pagada),
+      cant_regalo: n(d.cant_regalo),
+      costo_unit: n(d.costo_unit),
+      vencimiento: d.vencimiento || null,
+      precio: n(d.precio) || actual.precio || 0,
     });
+    form.hidden = true;
+    sel.reiniciar();
+    dibujarLlegada();
+    aviso(`${nombreProducto(actual)} agregado`);
+    actual = null;
   };
+
+  async function guardarLlegada() {
+    // Leer todo antes de guardar: si cambia la pantalla a mitad de camino, igual se guarda bien
+    const flete = n($('#flete').value);
+    const valor = lineas.reduce((s, l) => s + l.cant_pagada * l.costo_unit, 0);
+    const proveedor = $('#proveedor').value.trim();
+    const fechaLlegada = $('#fecha').value || hoy();
+
+    // Crear los productos que todavía no existen
+    for (const l of lineas) {
+      if (l.producto_id) continue;
+      const ya = productos.find(p => clave({ marca: p.marca || p.nombre, presentacion: p.presentacion || '', sabor: p.sabor || '' }) === clave(l));
+      if (ya) { l.producto_id = ya.id; continue; }
+      const nuevo = await q(sb.from('productos').insert({
+        nombre: nombreProducto(l), marca: l.marca, presentacion: l.presentacion || null, sabor: l.sabor || null,
+        unidad: l.unidad, precio_general: n(l.precio),
+      }).select().single());
+      productos.push(nuevo);
+      l.producto_id = nuevo.id;
+    }
+
+    // Repartir el flete según el valor de cada producto (el último se lleva el redondeo)
+    let repartido = 0;
+    const filas = lineas.map((l, i) => {
+      const parte = i === lineas.length - 1
+        ? Math.round((flete - repartido) * 100) / 100
+        : Math.round(flete * (valor ? (l.cant_pagada * l.costo_unit) / valor : 1 / lineas.length) * 100) / 100;
+      repartido += parte;
+      return {
+        producto_id: l.producto_id, fecha: fechaLlegada, proveedor: proveedor || null,
+        cant_pagada: l.cant_pagada, cant_regalo: l.cant_regalo, costo_unit: l.costo_unit,
+        flete: parte, vencimiento: l.vencimiento,
+      };
+    });
+    await q(sb.from('lotes').insert(filas));
+
+    // Si se puso precio a un producto que no tenía, guardarlo
+    for (const l of lineas) {
+      const p = productos.find(x => x.id === l.producto_id);
+      if (p && !n(p.precio_general) && n(l.precio)) {
+        await q(sb.from('productos').update({ precio_general: n(l.precio) }).eq('id', p.id));
+      }
+    }
+    guardar('proveedor', proveedor);
+    aviso(`Llegada guardada: ${lineas.length} producto(s)`);
+    llego();
+  }
+
+  dibujarLlegada();
 }
 
 // =====================================================================
@@ -328,70 +569,80 @@ async function llego() {
 // =====================================================================
 
 async function vender() {
-  const [productos, clientes, stock, viaje] = await Promise.all([
-    q(sb.from('productos').select('*').eq('activo', true).order('nombre')),
+  const [{ opciones }, clientes, recientes, viaje] = await Promise.all([
+    opcionesConStock(),
     q(sb.from('clientes').select('id, nombre').eq('activo', true).order('nombre')),
-    stockDisponible(),
+    q(sb.from('ventas').select('cliente_id').not('cliente_id', 'is', null).order('id', { ascending: false }).limit(300)),
     viajeAbierto(),
   ]);
-  const conStock = productos.filter(p => stock.porProducto[p.id]);
   const buscarCliente = nombre => clientes.find(c => c.nombre.trim().toLowerCase() === nombre.trim().toLowerCase());
+
+  // Clientes que más compran últimamente, para tocarlos sin escribir
+  const veces = {};
+  for (const v of recientes) veces[v.cliente_id] = (veces[v.cliente_id] || 0) + 1;
+  const frecuentes = clientes.filter(c => veces[c.id]).sort((a, b) => veces[b.id] - veces[a.id]).slice(0, 8);
 
   let items = [];
   let tipo = 'contado';
   let preciosCliente = {};
+  let actual = null;
+  let sel;
 
-  pantalla('🛒 Vender', `
+  pantalla('vender', 'Vender', `
     <div class="tarjeta">
       <label>Cliente
-        <input id="cliente" list="lista-cli" placeholder="Escribe el nombre (vacío = cliente de paso)" autocomplete="off">
+        <input id="cliente" list="lista-cli" placeholder="Nombre (vacío = cliente de paso)" autocomplete="off">
       </label>
       <datalist id="lista-cli">${clientes.map(c => `<option value="${esc(c.nombre)}">`).join('')}</datalist>
+      ${frecuentes.length ? `<div class="opciones compacto">${frecuentes.map(c => `<button type="button" class="opcion" data-cliente="${esc(c.nombre)}">${esc(c.nombre)}</button>`).join('')}</div>` : ''}
       <p class="nota" id="nota-cliente"></p>
     </div>
-    <form id="agregar" class="tarjeta" autocomplete="off">
-      <label>Producto
-        <select name="producto_id" required>
-          <option value="">— elegir —</option>
-          ${conStock.map(p => `<option value="${p.id}">${esc(p.nombre)} (quedan ${cant(stock.porProducto[p.id].restante)})</option>`).join('')}
-        </select>
-      </label>
-      <div class="fila2">
-        <label>Cantidad <input name="cantidad" type="number" step="any" min="0" inputmode="decimal" required></label>
-        <label>Precio por unidad <input name="precio" type="number" step="any" min="0" inputmode="decimal" required></label>
-      </div>
+    <div class="tarjeta" id="sel"></div>
+    <form id="agregar" class="tarjeta" hidden autocomplete="off">
+      <p class="paso" id="prod-nombre"></p>
+      ${campoCantidad('Cantidad')}
+      <label>Precio por unidad (Bs) <input name="precio" type="number" step="any" min="0" inputmode="decimal" required></label>
       <p class="nota" id="nota-precio"></p>
-      <button class="btn grande">+ Agregar</button>
+      <button class="btn primario grande">${icono('mas')} Agregar</button>
     </form>
     <div class="tarjeta" id="carrito"></div>
     <div class="tarjeta">
-      <b>¿Cómo paga?</b>
+      <p class="paso">¿Cómo paga?</p>
       <div class="tipos">
-        <button data-tipo="contado" class="activo">💵 Contado</button>
-        <button data-tipo="fiado">📝 Fiado</button>
-        <button data-tipo="pedido">📋 Pedido (entrega después)</button>
-        <button data-tipo="regalo">🎁 Regalo</button>
+        <button data-tipo="contado" class="activo">${icono('cobrar')} Contado</button>
+        <button data-tipo="fiado">${icono('fiado')} Fiado</button>
+        <button data-tipo="pedido">${icono('calendario')} Pedido</button>
+        <button data-tipo="regalo">${icono('regalo')} Regalo</button>
       </div>
       <div id="extra"></div>
       ${viaje ? '<label class="check"><input type="checkbox" id="desde-camion" checked> Venta desde el camión</label>' : ''}
       <label>Nota <input id="nota" placeholder="opcional"></label>
-      <button class="btn primario grande" id="guardar">Guardar venta</button>
+      <button class="btn primario grande" id="guardar">${icono('ok')} Guardar venta</button>
     </div>`);
 
   const form = $('#agregar');
-  const selProducto = form.producto_id;
+  activarCantidad(form);
+  const yaEnCarrito = id => items.filter(i => i.producto_id === id).reduce((s, i) => s + i.cantidad, 0);
 
-  const precioSugerido = () => {
-    const p = productos.find(x => x.id == selProducto.value);
-    if (!p) { $('#nota-precio').textContent = ''; return; }
-    const especial = preciosCliente[p.id];
-    form.precio.value = especial ?? p.precio_general ?? '';
-    const costo = stock.porProducto[p.id].costoPrimero;
-    $('#nota-precio').innerHTML = (especial != null ? 'Precio que le diste a este cliente la última vez.' : 'Precio general.')
-      + ` Costo: ${bs(costo)}.`;
+  const sugerirPrecio = () => {
+    if (!actual) return;
+    const especial = preciosCliente[actual.producto_id];
+    form.precio.value = especial ?? actual.precio ?? '';
+    $('#nota-precio').innerHTML = (especial != null ? 'Precio que le diste a este cliente la última vez.'
+      : actual.precio ? 'Precio general.' : 'Este producto no tiene precio general: escríbelo.') + ` Costo: ${bs(actual.costo)}.`;
   };
 
-  $('#cliente').oninput = async () => {
+  const elegir = o => {
+    actual = o;
+    form.hidden = !o;
+    if (!o) return;
+    $('#prod-nombre').textContent = `${nombreProducto(o)} · quedan ${cant(o.stock - yaEnCarrito(o.producto_id))} ${unidad(o.unidad)}`;
+    form.cantidad.value = '';
+    sugerirPrecio();
+  };
+  sel = selector($('#sel'), opciones, { alElegir: elegir, conStock: true });
+
+  const elegirCliente = async () => {
     const c = buscarCliente($('#cliente').value);
     preciosCliente = {};
     if (c) {
@@ -402,11 +653,10 @@ async function vender() {
     } else {
       $('#nota-cliente').textContent = $('#cliente').value.trim() ? 'Cliente nuevo: se guardará al vender.' : '';
     }
-    precioSugerido();
+    sugerirPrecio();
   };
-  selProducto.onchange = precioSugerido;
-
-  const yaEnCarrito = id => items.filter(i => i.producto_id == id).reduce((s, i) => s + i.cantidad, 0);
+  $('#cliente').oninput = elegirCliente;
+  $$('[data-cliente]').forEach(b => b.onclick = () => { $('#cliente').value = b.dataset.cliente; elegirCliente(); });
 
   const dibujarCarrito = () => {
     const total = items.reduce((s, i) => s + i.cantidad * i.precio, 0);
@@ -418,30 +668,28 @@ async function vender() {
             <small>${cant(i.cantidad)} × ${bs(i.precio)}${i.precio < i.costo ? ' · <span class="negativo">¡por debajo del costo!</span>' : ''}</small>
           </div>
           <div class="monto">${bs(i.cantidad * i.precio)}</div>
-          <button class="chico peligro" data-quitar="${k}" aria-label="Quitar">✕</button>
+          <button class="chico peligro" data-quitar="${k}" aria-label="Quitar">${icono('cerrar')}</button>
         </div>`).join('')}
       <ul class="lineas">
         <li class="total"><span>Total</span><b>${bs(tipo === 'regalo' ? 0 : total)}</b></li>
         ${tipo === 'regalo' ? '' : `<li><span>Ganancia de esta venta</span><b class="${ganancia >= 0 ? 'positivo' : 'negativo'}">${bs(ganancia)}</b></li>`}
-      </ul>` : '<p class="nota">Agrega productos arriba.</p>';
+      </ul>` : '<p class="nota">Elige los productos arriba.</p>';
     $$('[data-quitar]').forEach(b => b.onclick = () => { items.splice(+b.dataset.quitar, 1); dibujarCarrito(); });
   };
 
   form.onsubmit = e => {
     e.preventDefault();
-    const d = datos(form);
-    const p = productos.find(x => x.id == d.producto_id);
-    const disponible = stock.porProducto[p.id].restante - yaEnCarrito(p.id);
-    const cantidad = n(d.cantidad);
+    const disponible = actual.stock - yaEnCarrito(actual.producto_id);
+    const cantidad = n(form.cantidad.value);
+    const precio = n(form.precio.value);
     if (cantidad <= 0) return aviso('Pon una cantidad', true);
-    if (cantidad > disponible + 1e-9) return aviso(`Solo quedan ${cant(disponible)} de ${p.nombre}`, true);
-    const precio = n(d.precio);
-    const costo = stock.porProducto[p.id].costoPrimero;
-    if (tipo !== 'regalo' && precio < costo &&
-        !confirm(`Estás vendiendo a ${bs(precio)} y te costó ${bs(costo)}. Vas a perder plata. ¿Seguro?`)) return;
-    items.push({ producto_id: p.id, nombre: p.nombre, cantidad, precio, costo });
-    form.reset();
-    $('#nota-precio').textContent = '';
+    if (cantidad > disponible + 1e-9) return aviso(`Solo quedan ${cant(disponible)} de ${nombreProducto(actual)}`, true);
+    if (tipo !== 'regalo' && precio < actual.costo &&
+        !confirm(`Estás vendiendo a ${bs(precio)} y te costó ${bs(actual.costo)}. Vas a perder plata. ¿Seguro?`)) return;
+    items.push({ producto_id: actual.producto_id, nombre: nombreProducto(actual), cantidad, precio, costo: actual.costo });
+    form.hidden = true;
+    actual = null;
+    sel.reiniciar();
     dibujarCarrito();
   };
 
@@ -469,25 +717,25 @@ async function vender() {
     if (!items.length) throw new Error('Agrega al menos un producto');
     const nombre = $('#cliente').value.trim();
     if (tipo !== 'contado' && !nombre) throw new Error('Para fiado, pedido o regalo escribe el nombre del cliente');
+    // Leer todo antes de guardar: si cambia la pantalla a mitad de camino, igual se guarda bien
+    const venta = {
+      tipo,
+      fecha_compromiso: $('#compromiso')?.value || null,
+      viaje_id: viaje && $('#desde-camion')?.checked ? viaje.id : null,
+      pagado: n($('#pagado')?.value),
+      nota: $('#nota').value.trim() || null,
+      items: items.map(({ producto_id, cantidad, precio }) => ({ producto_id, cantidad, precio })),
+    };
     let cliente = nombre ? buscarCliente(nombre) : null;
     if (nombre && !cliente) cliente = await q(sb.from('clientes').insert({ nombre }).select().single());
     const total = items.reduce((s, i) => s + i.cantidad * i.precio, 0);
-    await q(sb.rpc('registrar_venta', {
-      p: {
-        cliente_id: cliente?.id ?? null,
-        tipo,
-        fecha_compromiso: $('#compromiso')?.value || null,
-        viaje_id: viaje && $('#desde-camion')?.checked ? viaje.id : null,
-        pagado: n($('#pagado')?.value),
-        nota: $('#nota').value.trim() || null,
-        items: items.map(({ producto_id, cantidad, precio }) => ({ producto_id, cantidad, precio })),
-      },
-    }));
-    aviso(tipo === 'regalo' ? 'Regalo guardado ✔' : `Venta guardada: ${bs(total)} ✔`);
+    await q(sb.rpc('registrar_venta', { p: { ...venta, cliente_id: cliente?.id ?? null } }));
+    aviso(tipo === 'regalo' ? 'Regalo guardado' : `Venta guardada: ${bs(total)}`);
     vender();
   });
 
   dibujarCarrito();
+  if (!opciones.length) $('#sel').innerHTML = '<p class="nota">No hay stock. Registra lo que llega en "Llegó mercadería".</p>';
 }
 
 // =====================================================================
@@ -501,16 +749,17 @@ async function cobrar() {
   ]);
   const total = saldos.reduce((s, c) => s + n(c.saldo), 0);
 
-  pantalla('💵 Cobrar', `
+  pantalla('cobrar', 'Cobrar', `
     <div class="cifras"><div class="cifra"><small>Me deben en total</small><b>${bs(total)}</b></div>
       <div class="cifra"><small>Clientes que deben</small><b>${saldos.length}</b></div></div>
+    ${saldos.length > 5 ? `<label class="buscador">${icono('buscar')}<input id="buscar" placeholder="Buscar cliente"></label>` : ''}
     ${saldos.map(c => {
       const atrasado = c.compromiso && c.compromiso < hoy();
       const tel = (c.telefono || '').replace(/\D/g, '');
       const wa = tel ? `https://wa.me/${tel.length === 8 ? '591' + tel : tel}?text=${encodeURIComponent(
         `Hola ${c.nombre}, te recuerdo tu saldo pendiente de ${bs(c.saldo)}. Gracias.`)}` : '';
       return `
-      <div class="tarjeta">
+      <div class="tarjeta" data-nombre="${esc(c.nombre.toLowerCase())}">
         <div class="item">
           <div class="info"><b>${esc(c.nombre)}</b>
             <small>${c.compromiso ? (atrasado ? `<span class="negativo">Debía pagar el ${fecha(c.compromiso)}</span>` : `Paga hasta el ${fecha(c.compromiso)}`) : ''}</small>
@@ -521,11 +770,19 @@ async function cobrar() {
           <input name="monto" type="number" step="any" min="0" inputmode="decimal" placeholder="¿Cuánto pagó?" required>
           <button class="primario">Cobrar</button>
         </form>
-        ${wa ? `<p class="nota"><a href="${wa}" target="_blank" rel="noopener">Recordarle por WhatsApp</a></p>` : ''}
+        <div class="rapidos"><button type="button" class="chico" data-todo="${c.saldo}">Pagó todo</button>
+          ${wa ? `<a class="btn chico" href="${wa}" target="_blank" rel="noopener">${icono('mensaje')} Recordar por WhatsApp</a>` : ''}</div>
       </div>`;
-    }).join('') || '<p class="tarjeta">Nadie te debe. 🎉</p>'}
+    }).join('') || '<p class="tarjeta">Nadie te debe.</p>'}
     ${viaje ? '<label class="check"><input type="checkbox" id="desde-camion" checked> Cobros hechos en la ruta del camión</label>' : ''}`);
 
+  if ($('#buscar')) $('#buscar').oninput = () => {
+    const t = $('#buscar').value.trim().toLowerCase();
+    $$('[data-nombre]').forEach(el => (el.hidden = !el.dataset.nombre.includes(t)));
+  };
+  $$('[data-todo]').forEach(b => b.onclick = () => {
+    b.closest('.tarjeta').querySelector('input[name=monto]').value = n(b.dataset.todo).toFixed(2);
+  });
   $$('form[data-cliente]').forEach(form => form.onsubmit = e => {
     e.preventDefault();
     conEspera(form.querySelector('button'), async () => {
@@ -538,7 +795,7 @@ async function cobrar() {
         monto,
         viaje_id: viaje && $('#desde-camion')?.checked ? viaje.id : null,
       }));
-      aviso(`Cobro de ${bs(monto)} guardado ✔`);
+      aviso(`Cobro de ${bs(monto)} guardado`);
       cobrar();
     });
   });
@@ -554,25 +811,23 @@ async function camion() {
 }
 
 async function camionSalida() {
-  const [stock, anteriores] = await Promise.all([
-    stockDisponible(),
+  const [{ opciones }, anteriores] = await Promise.all([
+    opcionesConStock(),
     q(sb.from('viajes').select('*').not('regreso', 'is', null).order('id', { ascending: false }).limit(5)),
   ]);
-  const productos = Object.values(stock.porProducto).sort((a, b) => a.nombre.localeCompare(b.nombre));
-  const opciones = productos.map(p => `<option value="${p.id}">${esc(p.nombre)} (hay ${cant(p.restante)})</option>`).join('');
-  const fila = () => `
-    <div class="fila2 carga">
-      <select name="producto"><option value="">— producto —</option>${opciones}</select>
-      <input name="cantidad" type="number" step="any" min="0" inputmode="decimal" placeholder="Cantidad">
-    </div>`;
+  const carga = [];
+  let actual = null;
+  let sel;
 
-  pantalla('🚚 Cargar camión', `
-    <form id="f" class="tarjeta">
-      <p class="nota">Anota lo que sube al camión. Al volver, cuentas lo que regresó y la app te dice qué falta.</p>
-      <div id="filas">${fila()}${fila()}${fila()}</div>
-      <button type="button" class="btn" id="mas" style="width:100%;margin-top:10px">+ Otro producto</button>
-      <button class="btn primario grande">Salió el camión</button>
+  pantalla('camion', 'Cargar camión', `
+    <p class="nota">Anota lo que sube al camión. Al volver cuentas lo que regresó y la app te dice qué falta.</p>
+    <div class="tarjeta" id="sel"></div>
+    <form id="agregar" class="tarjeta" hidden autocomplete="off">
+      <p class="paso" id="prod-nombre"></p>
+      ${campoCantidad('Cantidad que sube')}
+      <button class="btn primario grande">${icono('mas')} Subir al camión</button>
     </form>
+    <div class="tarjeta" id="carga"></div>
     <h3>Viajes anteriores</h3>
     <div class="tarjeta">${anteriores.length ? anteriores.map(v => {
       const dif = n(v.efectivo_entregado) - n(v.efectivo_esperado);
@@ -581,33 +836,58 @@ async function camionSalida() {
         <div class="monto ${Math.abs(dif) < 0.01 ? 'positivo' : 'negativo'}">${Math.abs(dif) < 0.01 ? 'Cuadra' : bs(dif)}</div></div>`;
     }).join('') : '<p class="nota">Sin viajes todavía.</p>'}</div>`);
 
-  $('#mas').onclick = () => $('#filas').insertAdjacentHTML('beforeend', fila());
-  const form = $('#f');
-  form.onsubmit = e => {
-    e.preventDefault();
-    conEspera(form.querySelector('button.primario'), async () => {
-      const carga = {};
-      for (const div of $$('.carga')) {
-        const id = div.querySelector('select').value;
-        const c = n(div.querySelector('input').value);
-        if (id && c > 0) carga[id] = (carga[id] || 0) + c;
-      }
-      const filas = Object.entries(carga);
-      if (!filas.length) throw new Error('Anota al menos un producto');
-      for (const [id, c] of filas) {
-        if (c > stock.porProducto[id].restante + 1e-9) throw new Error(`No hay tanto ${stock.porProducto[id].nombre} (hay ${cant(stock.porProducto[id].restante)})`);
-      }
+  const form = $('#agregar');
+  activarCantidad(form);
+  const cargado = id => carga.filter(c => c.producto_id === id).reduce((s, c) => s + c.cantidad, 0);
+
+  sel = selector($('#sel'), opciones, {
+    conStock: true,
+    alElegir: o => {
+      actual = o;
+      form.hidden = !o;
+      if (!o) return;
+      $('#prod-nombre').textContent = `${nombreProducto(o)} · hay ${cant(o.stock - cargado(o.producto_id))} ${unidad(o.unidad)}`;
+      form.cantidad.value = '';
+    },
+  });
+
+  const dibujarCarga = () => {
+    $('#carga').innerHTML = carga.length ? `
+      <p class="paso">Sube al camión</p>
+      ${carga.map((c, i) => `<div class="item"><div class="info"><b>${esc(c.nombre)}</b></div>
+        <div class="monto">${cant(c.cantidad)}</div>
+        <button class="chico peligro" data-quitar="${i}" aria-label="Quitar">${icono('cerrar')}</button></div>`).join('')}
+      <button class="btn primario grande" id="salir-camion">${icono('camion')} Salió el camión</button>`
+      : '<p class="nota">Elige los productos que suben al camión.</p>';
+    $$('[data-quitar]').forEach(b => b.onclick = () => { carga.splice(+b.dataset.quitar, 1); dibujarCarga(); });
+    if (carga.length) $('#salir-camion').onclick = () => conEspera($('#salir-camion'), async () => {
       const viaje = await q(sb.from('viajes').insert({}).select().single());
+      const filas = {};
+      for (const c of carga) filas[c.producto_id] = (filas[c.producto_id] || 0) + c.cantidad;
       try {
-        await q(sb.from('viaje_carga').insert(filas.map(([id, c]) => ({ viaje_id: viaje.id, producto_id: +id, cargado: c }))));
+        await q(sb.from('viaje_carga').insert(Object.entries(filas).map(([id, c]) => ({ viaje_id: viaje.id, producto_id: +id, cargado: c }))));
       } catch (err) {
         await sb.from('viajes').delete().eq('id', viaje.id);
         throw err;
       }
-      aviso('Camión en ruta 🚚');
+      aviso('Camión en ruta');
       camion();
     });
   };
+
+  form.onsubmit = e => {
+    e.preventDefault();
+    const cantidad = n(form.cantidad.value);
+    const hay = actual.stock - cargado(actual.producto_id);
+    if (cantidad <= 0) return aviso('Pon una cantidad', true);
+    if (cantidad > hay + 1e-9) return aviso(`Solo hay ${cant(hay)}`, true);
+    carga.push({ producto_id: actual.producto_id, nombre: nombreProducto(actual), cantidad });
+    form.hidden = true;
+    actual = null;
+    sel.reiniciar();
+    dibujarCarga();
+  };
+  dibujarCarga();
 }
 
 async function camionEnRuta(viajeId) {
@@ -621,7 +901,7 @@ async function camionEnRuta(viajeId) {
   for (const v of vendidos) vendido[v.producto_id] = (vendido[v.producto_id] || 0) + n(v.cantidad);
   const esperado = pagos.reduce((s, p) => s + n(p.monto), 0);
 
-  pantalla('🚚 Camión en ruta', `
+  pantalla('camion', 'Camión en ruta', `
     <p class="nota">Salió: ${fechaHora(viaje.salida)} · Las ventas marcadas "desde el camión" se van sumando aquí.</p>
     <form id="f" class="tarjeta">
       <table>
@@ -643,9 +923,9 @@ async function camionEnRuta(viajeId) {
       </ul>
       <label>¿Cuánta plata trajo? <input id="efectivo" type="number" step="any" min="0" inputmode="decimal" value="${esperado.toFixed(2)}"></label>
       <p class="nota" id="dif-plata"></p>
-      <button class="btn primario grande">Regresó el camión</button>
+      <button class="btn primario grande">${icono('ok')} Regresó el camión</button>
     </form>
-    ${vendidos.length ? '' : '<button class="btn peligro" id="cancelar" style="width:100%">Cancelar esta salida</button>'}`);
+    ${vendidos.length ? '' : `<button class="btn peligro" id="cancelar" style="width:100%">${icono('cerrar')} Cancelar esta salida</button>`}`);
 
   const revisar = () => {
     const faltan = $$('[data-producto]').map(i => ({
@@ -656,7 +936,7 @@ async function camionEnRuta(viajeId) {
       ? '<b class="negativo">Falta:</b> ' + faltan.map(x => `${esc(x.nombre)}: ${cant(x.falta)}`).join(' · ')
       : '';
     const dif = n($('#efectivo').value) - esperado;
-    $('#dif-plata').innerHTML = Math.abs(dif) < 0.01 ? '<span class="positivo">La plata cuadra ✔</span>'
+    $('#dif-plata').innerHTML = Math.abs(dif) < 0.01 ? '<span class="positivo">La plata cuadra</span>'
       : `<span class="negativo">${dif < 0 ? 'Faltan' : 'Sobran'} ${bs(Math.abs(dif))}</span>`;
   };
   $('#f').oninput = revisar;
@@ -671,7 +951,7 @@ async function camionEnRuta(viajeId) {
         p_efectivo: n($('#efectivo').value),
         p_marcar: $('#marcar').checked,
       }));
-      aviso('Viaje cerrado ✔');
+      aviso('Viaje cerrado');
       location.hash = '#inicio';
     });
   };
@@ -694,22 +974,22 @@ async function gasto() {
   const gastos = await q(sb.from('gastos').select('*').gte('fecha', desde).order('fecha', { ascending: false }).order('id', { ascending: false }));
   const total = gastos.reduce((s, g) => s + n(g.monto), 0);
 
-  pantalla('🧾 Gasto', `
+  pantalla('gasto', 'Gasto', `
     <form id="f" class="tarjeta">
-      <b>¿En qué se gastó?</b>
+      <p class="paso">¿En qué se gastó?</p>
       <div class="tipos">${CATEGORIAS.map((c, i) => `<button type="button" data-cat="${esc(c)}" class="${i === 0 ? 'activo' : ''}">${esc(c)}</button>`).join('')}</div>
       <div class="fila2">
         <label>Monto (Bs) <input name="monto" type="number" step="any" min="0" inputmode="decimal" required></label>
         <label>Fecha <input name="fecha" type="date" value="${hoy()}" required></label>
       </div>
       <label>Detalle <input name="nota" placeholder="opcional"></label>
-      <button class="btn primario grande">Guardar gasto</button>
+      <button class="btn primario grande">${icono('ok')} Guardar gasto</button>
     </form>
     <h3>Gastos de este mes · ${bs(total)}</h3>
     <div class="tarjeta">${gastos.map(g => `
       <div class="item"><div class="info"><b>${esc(g.categoria)}</b><small>${fecha(g.fecha)}${g.nota ? ' · ' + esc(g.nota) : ''}</small></div>
         <div class="monto">${bs(g.monto)}</div>
-        <button class="chico peligro" data-borrar="${g.id}" aria-label="Borrar">✕</button></div>`).join('') || '<p class="nota">Sin gastos este mes.</p>'}
+        <button class="chico peligro" data-borrar="${g.id}" aria-label="Borrar">${icono('cerrar')}</button></div>`).join('') || '<p class="nota">Sin gastos este mes.</p>'}
     </div>`);
 
   let categoria = CATEGORIAS[0];
@@ -723,7 +1003,7 @@ async function gasto() {
     conEspera(form.querySelector('button.primario'), async () => {
       const d = datos(form);
       await q(sb.from('gastos').insert({ categoria, monto: n(d.monto), fecha: d.fecha, nota: d.nota.trim() || null }));
-      aviso('Gasto guardado ✔');
+      aviso('Gasto guardado');
       gasto();
     });
   };
@@ -740,10 +1020,10 @@ async function gasto() {
 
 async function stock() {
   const { porProducto } = await stockDisponible();
-  const lista = Object.values(porProducto).sort((a, b) => a.nombre.localeCompare(b.nombre));
+  const lista = Object.values(porProducto).sort((a, b) => a.nombre.localeCompare(b.nombre, 'es', { numeric: true }));
   const total = lista.reduce((s, p) => s + p.valor, 0);
 
-  pantalla('📊 Stock y vencimientos', `
+  pantalla('stock', 'Stock y vencimientos', `
     <div class="cifras"><div class="cifra"><small>Valor del stock (a costo)</small><b>${bs(total)}</b></div>
       <div class="cifra"><small>Productos con stock</small><b>${lista.length}</b></div></div>
     <p class="nota">Cada venta sale primero del lote que vence antes.</p>
@@ -754,7 +1034,7 @@ async function stock() {
         ${p.lotes.map(l => `
           <div class="item"><div class="info"><small>Lote del ${fecha(l.fecha)} · quedan ${cant(l.restante)} · costo ${bs(l.costo_real)}</small>
             ${etiquetaVence(l.vencimiento)}</div>
-            <button class="chico peligro" data-borrar="${l.id}" aria-label="Borrar lote">✕</button></div>`).join('')}
+            <button class="chico peligro" data-borrar="${l.id}" aria-label="Borrar lote">${icono('cerrar')}</button></div>`).join('')}
       </div>`).join('') || '<p class="tarjeta">No hay stock. Registra lo que llega en "Llegó mercadería".</p>'}`);
 
   $$('[data-borrar]').forEach(b => b.onclick = () => conEspera(b, async () => {
@@ -770,42 +1050,55 @@ async function stock() {
 // Bajas: pinchadas, vencidas
 // =====================================================================
 
+const MOTIVOS = { pinchada: 'Pinchada / rota', vencida: 'Vencida', otro: 'Otro' };
+
 async function baja() {
-  const [st, recientes] = await Promise.all([
-    stockDisponible(),
+  const [{ opciones }, recientes] = await Promise.all([
+    opcionesConStock(),
     q(sb.from('bajas').select('*, productos(nombre)').order('id', { ascending: false }).limit(15)),
   ]);
-  const productos = Object.values(st.porProducto).sort((a, b) => a.nombre.localeCompare(b.nombre));
+  let actual = null;
+  let motivo = 'pinchada';
 
-  pantalla('🗑️ Pinchadas / bajas', `
-    <form id="f" class="tarjeta">
-      <p class="nota">Opcional: los faltantes del camión se cuentan solos al regresar.</p>
-      <label>Producto
-        <select name="producto" required><option value="">— elegir —</option>
-          ${productos.map(p => `<option value="${p.id}">${esc(p.nombre)} (hay ${cant(p.restante)})</option>`).join('')}
-        </select></label>
-      <div class="fila2">
-        <label>Cantidad <input name="cantidad" type="number" step="any" min="0" inputmode="decimal" required></label>
-        <label>Motivo
-          <select name="motivo"><option value="pinchada">Pinchada / rota</option><option value="vencida">Vencida</option><option value="otro">Otro</option></select></label>
-      </div>
+  pantalla('baja', 'Pinchadas / bajas', `
+    <p class="nota">Opcional: los faltantes del camión se cuentan solos al regresar.</p>
+    <div class="tarjeta" id="sel"></div>
+    <form id="f" class="tarjeta" hidden autocomplete="off">
+      <p class="paso" id="prod-nombre"></p>
+      ${campoCantidad('Cantidad')}
+      <p class="paso">Motivo</p>
+      <div class="tipos">${Object.entries(MOTIVOS).map(([k, v]) => `<button type="button" data-motivo="${k}" class="${k === motivo ? 'activo' : ''}">${v}</button>`).join('')}</div>
       <label>Nota <input name="nota" placeholder="opcional"></label>
-      <button class="btn primario grande">Dar de baja</button>
+      <button class="btn primario grande">${icono('baja')} Dar de baja</button>
     </form>
     <h3>Últimas bajas</h3>
     <div class="tarjeta">${recientes.map(b => `
       <div class="item"><div class="info"><b>${esc(b.productos.nombre)}</b>
-        <small>${fechaHora(b.fecha)} · ${esc(b.motivo)} · ${cant(b.cantidad)}${b.nota ? ' · ' + esc(b.nota) : ''}</small></div>
+        <small>${fechaHora(b.fecha)} · ${esc(MOTIVOS[b.motivo] || b.motivo)} · ${cant(b.cantidad)}${b.nota ? ' · ' + esc(b.nota) : ''}</small></div>
         <div class="monto negativo">${bs(n(b.cantidad) * n(b.costo))}</div>
-        <button class="chico peligro" data-borrar="${b.id}" aria-label="Deshacer">✕</button></div>`).join('') || '<p class="nota">Sin bajas.</p>'}
+        <button class="chico peligro" data-borrar="${b.id}" aria-label="Deshacer">${icono('cerrar')}</button></div>`).join('') || '<p class="nota">Sin bajas.</p>'}
     </div>`);
 
   const form = $('#f');
+  activarCantidad(form);
+  selector($('#sel'), opciones, {
+    conStock: true,
+    alElegir: o => {
+      actual = o;
+      form.hidden = !o;
+      if (o) $('#prod-nombre').textContent = `${nombreProducto(o)} · hay ${cant(o.stock)} ${unidad(o.unidad)}`;
+    },
+  });
+  $$('[data-motivo]').forEach(b => b.onclick = () => {
+    motivo = b.dataset.motivo;
+    $$('[data-motivo]').forEach(x => x.classList.toggle('activo', x === b));
+  });
   form.onsubmit = e => {
     e.preventDefault();
-    conEspera(form.querySelector('button'), async () => {
-      const d = datos(form);
-      await q(sb.rpc('registrar_baja', { p_producto: +d.producto, p_cantidad: n(d.cantidad), p_motivo: d.motivo, p_nota: d.nota.trim() || null }));
+    conEspera(form.querySelector('button.primario'), async () => {
+      const cantidad = n(form.cantidad.value);
+      if (cantidad <= 0) throw new Error('Pon una cantidad');
+      await q(sb.rpc('registrar_baja', { p_producto: actual.producto_id, p_cantidad: cantidad, p_motivo: motivo, p_nota: form.nota.value.trim() || null }));
       aviso('Baja registrada');
       baja();
     });
@@ -848,7 +1141,7 @@ async function historial() {
     .select('id, fecha, tipo, total, fecha_compromiso, nota, clientes(nombre), venta_items(cantidad, precio, productos(nombre))')
     .gte('fecha', desde).order('fecha', { ascending: false }));
 
-  pantalla('📒 Ventas', `
+  pantalla('ventas', 'Ventas', `
     <div class="chips">${[1, 7, 30].map(d => `<button class="chip ${d === dias ? 'activo' : ''}" data-dias="${d}">${d === 1 ? 'Hoy' : d + ' días'}</button>`).join('')}</div>
     ${ventas.map(v => tarjetaVenta(v, `<button class="chico peligro" data-anular="${v.id}" style="margin-top:8px">Anular venta</button>`)).join('')
       || '<p class="tarjeta">Sin ventas en este periodo.</p>'}`);
@@ -871,7 +1164,7 @@ async function pedidos() {
     .select('id, fecha, tipo, total, fecha_compromiso, nota, cliente_id, clientes(nombre), venta_items(cantidad, precio, productos(nombre)), pagos(monto)')
     .eq('tipo', 'pedido').eq('entregado', false).order('fecha_compromiso'));
 
-  pantalla('📋 Pedidos por entregar', lista.map(v => {
+  pantalla('pedidos', 'Pedidos por entregar', lista.map(v => {
     const pagado = v.pagos.reduce((s, p) => s + n(p.monto), 0);
     const falta = n(v.total) - pagado;
     return tarjetaVenta(v, `
@@ -887,7 +1180,7 @@ async function pedidos() {
       await q(sb.from('pagos').insert({ cliente_id: +b.dataset.cliente, venta_id: +b.dataset.entregar, monto: n(b.dataset.cobrar) }));
     }
     await q(sb.from('ventas').update({ entregado: true }).eq('id', b.dataset.entregar));
-    aviso('Pedido entregado ✔');
+    aviso('Pedido entregado');
     pedidos();
   }));
 }
@@ -896,40 +1189,48 @@ async function pedidos() {
 // Productos
 // =====================================================================
 
+const OPCIONES_UNIDAD = { paq: 'Paquete', cja: 'Caja', fardo: 'Fardo', und: 'Unidad' };
+
 async function productos(id) {
   const lista = await q(sb.from('productos').select('*').order('activo', { ascending: false }).order('nombre'));
   const editando = id ? lista.find(p => p.id == id) : null;
 
-  pantalla('🥤 Productos', `
+  pantalla('productos', 'Productos', `
+    ${editando ? `
     <form id="f" class="tarjeta">
-      <b>${editando ? 'Editar producto' : 'Nuevo producto'}</b>
-      <label>Nombre <input name="nombre" required value="${esc(editando?.nombre)}" placeholder="Ej: Schneider lata 473 ml"></label>
+      <p class="paso">Editar ${esc(editando.nombre)}</p>
       <div class="fila2">
-        <label>Unidad <select name="unidad">${Object.entries({ paq: 'Paquete', cja: 'Caja', fardo: 'Fardo', und: 'Unidad' })
-          .map(([k, v]) => `<option value="${k}" ${editando?.unidad === k ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
-        <label>Precio general (Bs) <input name="precio_general" type="number" step="any" min="0" inputmode="decimal" value="${editando?.precio_general ?? ''}"></label>
+        <label>Marca <input name="marca" required value="${esc(editando.marca || editando.nombre)}"></label>
+        <label>Presentación <input name="presentacion" value="${esc(editando.presentacion)}"></label>
       </div>
-      ${editando ? `<label class="check"><input type="checkbox" name="activo" ${editando.activo ? 'checked' : ''}> Activo (se puede vender)</label>` : ''}
-      <button class="btn primario grande">${editando ? 'Guardar cambios' : 'Agregar producto'}</button>
-      ${editando ? '<a class="btn" href="#productos" style="width:100%;margin-top:8px">Cancelar</a>' : ''}
-    </form>
+      <div class="fila2">
+        <label>Sabor <input name="sabor" value="${esc(editando.sabor)}"></label>
+        <label>Se cuenta por <select name="unidad">${Object.entries(OPCIONES_UNIDAD)
+          .map(([k, v]) => `<option value="${k}" ${editando.unidad === k ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
+      </div>
+      <label>Precio de venta general (Bs) <input name="precio_general" type="number" step="any" min="0" inputmode="decimal" value="${editando.precio_general ?? ''}"></label>
+      <label class="check"><input type="checkbox" name="activo" ${editando.activo ? 'checked' : ''}> Activo (se puede vender)</label>
+      <button class="btn primario grande">${icono('ok')} Guardar cambios</button>
+      <a class="btn" href="#productos" style="width:100%;margin-top:8px">Cancelar</a>
+    </form>` : '<p class="nota">Los productos se crean solos al registrar una llegada. Toca uno para cambiar su precio general.</p>'}
     <div class="tarjeta">${lista.map(p => `
       <a class="item" href="#productos/${p.id}" style="text-decoration:none;color:inherit">
         <div class="info"><b>${esc(p.nombre)}</b><small>${unidad(p.unidad)}${p.activo ? '' : ' · inactivo'}</small></div>
-        <div class="monto">${bs(p.precio_general)}</div></a>`).join('') || '<p class="nota">Sin productos.</p>'}
+        <div class="monto">${n(p.precio_general) ? bs(p.precio_general) : '<span class="nota">sin precio</span>'}</div>
+        ${icono('editar', 'suave')}</a>`).join('') || '<p class="nota">Sin productos todavía.</p>'}
     </div>`, editando ? '#productos' : '#inicio');
 
   const form = $('#f');
-  form.onsubmit = e => {
+  if (form) form.onsubmit = e => {
     e.preventDefault();
     conEspera(form.querySelector('button'), async () => {
       const d = datos(form);
-      const fila = { nombre: d.nombre.trim(), unidad: d.unidad, precio_general: n(d.precio_general) };
-      if (editando) await q(sb.from('productos').update({ ...fila, activo: !!d.activo }).eq('id', editando.id));
-      else await q(sb.from('productos').insert(fila));
-      aviso('Guardado ✔');
+      const fila = { marca: d.marca.trim(), presentacion: d.presentacion.trim() || null, sabor: d.sabor.trim() || null };
+      await q(sb.from('productos').update({
+        ...fila, nombre: nombreProducto(fila), unidad: d.unidad, precio_general: n(d.precio_general), activo: !!d.activo,
+      }).eq('id', editando.id));
+      aviso('Guardado');
       location.hash = '#productos';
-      if (!editando) productos();
     });
   };
 }
@@ -946,17 +1247,17 @@ async function clientes(id) {
   ]);
   const saldo = Object.fromEntries(saldos.map(s => [s.cliente_id, n(s.saldo)]));
 
-  pantalla('👥 Clientes', `
+  pantalla('clientes', 'Clientes', `
     <form id="f" class="tarjeta">
-      <b>Nuevo cliente</b>
+      <p class="paso">Nuevo cliente</p>
       <label>Nombre <input name="nombre" required></label>
       <div class="fila2">
         <label>Teléfono <input name="telefono" type="tel" inputmode="tel"></label>
         <label>Ya me debía (Bs) <input name="deuda_inicial" type="number" step="any" min="0" inputmode="decimal" value="0"></label>
       </div>
-      <button class="btn primario grande">Agregar cliente</button>
+      <button class="btn primario grande">${icono('mas')} Agregar cliente</button>
     </form>
-    <input id="buscar" placeholder="🔍 Buscar cliente">
+    <label class="buscador">${icono('buscar')}<input id="buscar" placeholder="Buscar cliente"></label>
     <div class="tarjeta" id="lista">${lista.map(c => `
       <a class="item" href="#clientes/${c.id}" data-nombre="${esc(c.nombre.toLowerCase())}" style="text-decoration:none;color:inherit">
         <div class="info"><b>${esc(c.nombre)}</b><small>${esc(c.telefono || '')}</small></div>
@@ -973,7 +1274,7 @@ async function clientes(id) {
     conEspera(form.querySelector('button'), async () => {
       const d = datos(form);
       await q(sb.from('clientes').insert({ nombre: d.nombre.trim(), telefono: d.telefono.trim() || null, deuda_inicial: n(d.deuda_inicial) }));
-      aviso('Cliente guardado ✔');
+      aviso('Cliente guardado');
       clientes();
     });
   };
@@ -989,7 +1290,7 @@ async function cliente(id) {
   ]);
   const debe = n(saldo[0]?.saldo);
 
-  pantalla(esc(c.nombre), `
+  pantalla('clientes', esc(c.nombre), `
     <div class="cifras"><div class="cifra"><small>Debe</small><b class="${debe > 0 ? 'negativo' : ''}">${bs(debe)}</b></div>
       <div class="cifra"><small>Paga hasta</small><b>${saldo[0]?.compromiso ? fecha(saldo[0].compromiso) : '—'}</b></div></div>
     <form id="f" class="tarjeta">
@@ -999,7 +1300,7 @@ async function cliente(id) {
         <label>Deuda anterior (Bs) <input name="deuda_inicial" type="number" step="any" min="0" value="${c.deuda_inicial}"></label>
       </div>
       <label>Notas <input name="notas" value="${esc(c.notas)}"></label>
-      <button class="btn primario grande">Guardar</button>
+      <button class="btn primario grande">${icono('ok')} Guardar</button>
     </form>
     <h3>Sus precios</h3>
     <div class="tarjeta">${precios.map(p => `
@@ -1016,19 +1317,20 @@ async function cliente(id) {
       await q(sb.from('clientes').update({
         nombre: d.nombre.trim(), telefono: d.telefono.trim() || null, deuda_inicial: n(d.deuda_inicial), notas: d.notas.trim() || null,
       }).eq('id', id));
-      aviso('Guardado ✔');
+      aviso('Guardado');
       cliente(id);
     });
   };
 }
 
 // =====================================================================
-// Más pantallas y arranque
+// Entrada y navegación
 // =====================================================================
 
 function login() {
   app.innerHTML = `
     <div class="login">
+      <div class="logo">${icono('llego')}</div>
       <h1>Mi Almacén</h1>
       <form id="f" class="tarjeta">
         <label>Correo <input name="email" type="email" autocomplete="username" required></label>
@@ -1057,7 +1359,7 @@ async function navegar() {
   try {
     await (rutas[ruta] || inicio)(param);
   } catch (e) {
-    pantalla('Algo salió mal', `<p class="tarjeta error">${esc(e.message || e)}</p><p class="nota">Revisa tu conexión a internet y vuelve a intentar.</p>`);
+    pantalla('alerta', 'Algo salió mal', `<p class="tarjeta error">${esc(e.message || e)}</p><p class="nota">Revisa tu conexión a internet y vuelve a intentar.</p>`);
   }
   window.scrollTo(0, 0);
 }

@@ -9,6 +9,9 @@ create table productos (
   id             bigint generated always as identity primary key,
   owner          uuid not null default auth.uid(),
   nombre         text not null,                       -- "Mendocina Cola 3 L"
+  marca          text,                                -- "Mendocina"
+  presentacion   text,                                -- "3 L", "Lata 473 ml"
+  sabor          text,                                -- "Cola" (vacío si no aplica)
   unidad         text not null default 'paq',         -- paq, cja, fardo, und
   precio_general numeric(10,2) not null default 0,    -- precio de lista
   activo         boolean not null default true,
