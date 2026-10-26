@@ -622,7 +622,7 @@ async function camionEnRuta(viajeId) {
   const esperado = pagos.reduce((s, p) => s + n(p.monto), 0);
 
   pantalla('🚚 Camión en ruta', `
-    <p class="nota">Salió: ${fechaHora(viaje.salida)}. Las ventas marcadas "desde el camión" se van sumando aquí.</p>
+    <p class="nota">Salió: ${fechaHora(viaje.salida)} · Las ventas marcadas "desde el camión" se van sumando aquí.</p>
     <form id="f" class="tarjeta">
       <table>
         <thead><tr><th>Producto</th><th class="n">Cargó</th><th class="n">Vendió</th><th class="n">Volvió</th></tr></thead>
